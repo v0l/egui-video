@@ -19,7 +19,7 @@ use egui::{
     Spinner, TextureHandle, TextureOptions, Ui, Vec2,
 };
 use ffmpeg::error::EAGAIN;
-use ffmpeg::ffi::{AVERROR, AV_TIME_BASE};
+use ffmpeg::ffi::{AVERROR, AV_NOPTS_VALUE, AV_TIME_BASE};
 use ffmpeg::format::context::input::Input;
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::frame::Audio;
@@ -273,7 +273,11 @@ impl Player {
         format!(
             "{} / {}",
             format_duration(Duration::milliseconds(self.elapsed_ms())),
-            format_duration(Duration::milliseconds(self.duration_ms))
+            format_duration(Duration::milliseconds(if self.duration_ms == AV_NOPTS_VALUE {
+                0
+            } else {
+                self.duration_ms
+            }))
         )
     }
     fn reset(&mut self) {
