@@ -19,7 +19,7 @@ use egui::{
     Spinner, TextureHandle, TextureOptions, Ui, Vec2,
 };
 use ffmpeg::error::EAGAIN;
-use ffmpeg::ffi::{AVERROR, AV_NOPTS_VALUE, AV_TIME_BASE};
+use ffmpeg::ffi::{AVERROR, AV_TIME_BASE};
 use ffmpeg::format::context::input::Input;
 use ffmpeg::format::{input, Pixel};
 use ffmpeg::frame::Audio;
@@ -273,7 +273,7 @@ impl Player {
         format!(
             "{} / {}",
             format_duration(Duration::milliseconds(self.elapsed_ms())),
-            format_duration(Duration::milliseconds(if self.duration_ms == AV_NOPTS_VALUE {
+            format_duration(Duration::milliseconds(if self.duration_ms < 0 {
                 0
             } else {
                 self.duration_ms
@@ -929,7 +929,7 @@ impl Player {
                 if let Some(hover_pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
                     let sound_frac = 1.
                         - ((hover_pos - sound_slider_rect.left_top()).y
-                            / sound_slider_rect.height())
+                        / sound_slider_rect.height())
                         .max(0.)
                         .min(1.);
                     self.options
@@ -1421,7 +1421,7 @@ impl Streamer for AudioStreamer {
             ChannelLayout::STEREO,
             self.resampler.output().rate,
         )
-        .unwrap();
+            .unwrap();
         self.audio_decoder = new_decoder;
         self.resampler = new_resampler;
         new_stream_index
