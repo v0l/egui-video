@@ -26,7 +26,7 @@ ringbuf = "0.4.4"
 parking_lot = "0.12.3"
 itertools = "0.13.0"
 nom = "7.1.3"
-cpal = "0.15.3"
+cpal = { version = "0.15.3", features = ["oboe-shared-stdcxx"] }
 ffmpeg-the-third = { git = "https://github.com/shssoichiro/ffmpeg-the-third.git", branch = "master" }
 ffmpeg-sys-the-third = { git = "https://github.com/shssoichiro/ffmpeg-the-third.git", branch = "master", package = "ffmpeg-sys-the-third" }
 libc = { version = "0.2.160" }
