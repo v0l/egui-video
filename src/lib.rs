@@ -18,7 +18,6 @@ use egui::{
     vec2, Align2, Color32, ColorImage, FontId, Image, Pos2, Rect, Response, Rounding, Sense,
     Spinner, TextureHandle, TextureOptions, Ui, Vec2,
 };
-use ffmpeg::error::EAGAIN;
 use ffmpeg::ffi::{AVERROR, AV_TIME_BASE};
 use ffmpeg::format::context::input::Input;
 use ffmpeg::format::{input, Pixel, Sample};
@@ -1555,7 +1554,7 @@ impl Streamer for SubtitleStreamer {
             self.subtitle_decoder.decode(&packet, &mut decoded_frame)?;
             Ok((decoded_frame, packet.duration()))
         } else {
-            Err(ffmpeg::Error::from(AVERROR(EAGAIN)).into())
+            Err(ffmpeg::Error::from(AVERROR(libc::EAGAIN)).into())
         }
     }
     fn process_frame(&mut self, frame: Self::Frame) -> Result<Self::ProcessedFrame> {
@@ -1615,7 +1614,7 @@ fn is_ffmpeg_eof_error(error: &anyhow::Error) -> bool {
 fn is_ffmpeg_incomplete_error(error: &anyhow::Error) -> bool {
     matches!(
         error.downcast_ref::<ffmpeg::Error>(),
-        Some(ffmpeg::Error::Other { errno } ) if *errno == EAGAIN
+        Some(ffmpeg::Error::Other { errno } ) if *errno == libc::EAGAIN
     )
 }
 
