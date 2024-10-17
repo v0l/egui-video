@@ -1,5 +1,5 @@
 use eframe::NativeOptions;
-use egui::{CentralPanel, DragValue, Grid, Sense, Slider, TextEdit, Window};
+use egui::{CentralPanel, DragValue, Grid, Slider, TextEdit, Window};
 use egui_video::{AudioDevice, Player};
 fn main() {
     let _ = eframe::run_native(
@@ -21,7 +21,7 @@ impl Default for App {
     fn default() -> Self {
         Self {
             audio_device: AudioDevice::new().unwrap(),
-            media_path: String::new(),
+            media_path: "https://test-streams.mux.dev/tos_ismc/main.m3u8".to_string(),
             stream_size_scale: 1.,
             seek_frac: 0.,
             player: None,
@@ -31,7 +31,7 @@ impl Default for App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint();
+        //ctx.request_repaint();
         CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!self.media_path.is_empty(), |ui| {
@@ -57,24 +57,7 @@ impl eframe::App for App {
                     [ui.available_width(), ui.available_height()],
                     TextEdit::singleline(&mut self.media_path)
                         .hint_text("click to set path")
-                        .interactive(false),
                 );
-
-                if ui
-                    .interact(
-                        tedit_resp.rect,
-                        tedit_resp.id.with("click_sense"),
-                        Sense::click(),
-                    )
-                    .clicked()
-                {
-                    if let Some(path_buf) = rfd::FileDialog::new()
-                        .add_filter("videos", &["mp4", "gif", "webm", "mkv", "ogg"])
-                        .pick_file()
-                    {
-                        self.media_path = path_buf.as_path().to_string_lossy().to_string();
-                    }
-                }
             });
             ui.separator();
             if let Some(player) = self.player.as_mut() {
@@ -151,7 +134,7 @@ impl eframe::App for App {
                     });
                 });
 
-                player.ui(ui, player.size * self.stream_size_scale);
+                player.ui(ui, ui.available_size());
             }
         });
     }
