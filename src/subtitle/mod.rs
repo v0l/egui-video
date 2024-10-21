@@ -1,7 +1,4 @@
-use anyhow::Result;
 use egui::{Align2, Color32, Margin, Pos2};
-
-use self::ass::parse_ass_subtitle;
 
 mod ass;
 
@@ -68,16 +65,6 @@ impl Subtitle {
     pub(crate) fn with_duration_ms(mut self, duration_ms: i64) -> Self {
         self.remaining_duration_ms = duration_ms;
         self
-    }
-    pub(crate) fn from_ffmpeg_rect(rect: ffmpeg::subtitle::Rect<'_>) -> Result<Self> {
-        match rect {
-            ffmpeg::subtitle::Rect::Ass(ass) => parse_ass_subtitle(ass.get()),
-            ffmpeg::subtitle::Rect::Bitmap(_bitmap) => {
-                Ok(Subtitle::from_text("[ unsupported bitmap subtitle ]").with_duration_ms(500))
-            }
-            ffmpeg::subtitle::Rect::None(_none) => anyhow::bail!("no subtitle"),
-            ffmpeg::subtitle::Rect::Text(text) => Ok(Subtitle::from_text(text.get())),
-        }
     }
 }
 

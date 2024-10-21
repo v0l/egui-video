@@ -31,20 +31,13 @@ impl Default for App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        //ctx.request_repaint();
         CentralPanel::default().show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!self.media_path.is_empty(), |ui| {
                     if ui.button("load").clicked() {
-                        match Player::new(ctx, &self.media_path.replace("\"", "")).and_then(|p| {
-                            p.with_audio(&mut self.audio_device)
-                                .and_then(|p| p.with_subtitles())
-                        }) {
-                            Ok(player) => {
-                                self.player = Some(player);
-                            }
-                            Err(e) => println!("failed to make stream: {e}"),
-                        }
+                        let mut p = Player::new(ctx, &self.media_path.replace("\"", ""));
+                        p.start();
+                        self.player = Some(p);
                     }
                 });
                 ui.add_enabled_ui(!self.media_path.is_empty(), |ui| {
@@ -56,7 +49,7 @@ impl eframe::App for App {
                 let tedit_resp = ui.add_sized(
                     [ui.available_width(), ui.available_height()],
                     TextEdit::singleline(&mut self.media_path)
-                        .hint_text("click to set path")
+                        .hint_text("click to set path"),
                 );
             });
             ui.separator();
@@ -64,27 +57,27 @@ impl eframe::App for App {
                 Window::new("info").show(ctx, |ui| {
                     Grid::new("info_grid").show(ui, |ui| {
                         ui.label("frame rate");
-                        ui.label(player.framerate.to_string());
+                        ui.label(player.framerate().to_string());
                         ui.end_row();
 
                         ui.label("size");
-                        ui.label(format!("{}x{}", player.size.x, player.size.y));
+                        ui.label(format!("{}x{}", player.size().0, player.size().1));
                         ui.end_row();
 
                         ui.label("elapsed / duration");
-                        ui.label(player.duration_text());
+                        ui.label(format!("{}/{}", player.elapsed(), 0));
                         ui.end_row();
 
                         ui.label("state");
-                        ui.label(format!("{:?}", player.player_state.get()));
+                        ui.label(format!("{:?}", player.state()));
                         ui.end_row();
 
                         ui.label("has audio?");
-                        ui.label(player.audio_streamer.is_some().to_string());
+                        ui.label(true.to_string());
                         ui.end_row();
 
                         ui.label("has subtitles?");
-                        ui.label(player.subtitle_streamer.is_some().to_string());
+                        ui.label(false.to_string());
                         ui.end_row();
                     });
                 });
@@ -98,7 +91,7 @@ impl eframe::App for App {
                                 .speed(0.05)
                                 .range(0.0..=1.0),
                         );
-                        ui.checkbox(&mut player.options.looping, "loop");
+                        //ui.checkbox(&mut player.options.looping, "loop");
                     });
                     ui.horizontal(|ui| {
                         ui.label("size scale");
@@ -121,15 +114,15 @@ impl eframe::App for App {
                     });
                     ui.horizontal(|ui| {
                         ui.label("volume");
-                        let mut volume = player.options.audio_volume.get();
+                        let mut volume = player.volume();
                         if ui
                             .add(Slider::new(
                                 &mut volume,
-                                0.0..=player.options.max_audio_volume,
+                                0..=u8::MAX,
                             ))
                             .changed()
                         {
-                            player.options.audio_volume.set(volume);
+                            player.set_volume(volume);
                         };
                     });
                 });
