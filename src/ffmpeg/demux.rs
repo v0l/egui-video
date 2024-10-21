@@ -93,6 +93,7 @@ pub struct StreamInfoChannel {
     pub sample_rate: usize,
     pub format: usize,
     pub bitrate: usize,
+    pub duration: f32,
 }
 
 impl StreamInfoChannel {
@@ -167,6 +168,7 @@ impl Demuxer {
                         format: (*(*stream).codecpar).format as usize,
                         sample_rate: 0,
                         bitrate: (*(*stream).codecpar).bit_rate as usize,
+                        duration: av_q2d((*stream).time_base) as f32 * (*stream).duration as f32,
                     });
                 }
                 AVMediaType::AVMEDIA_TYPE_UNKNOWN => {}
@@ -180,6 +182,7 @@ impl Demuxer {
                         format: (*(*stream).codecpar).format as usize,
                         sample_rate: (*(*stream).codecpar).sample_rate as usize,
                         bitrate: (*(*stream).codecpar).bit_rate as usize,
+                        duration: av_q2d((*stream).time_base) as f32 * (*stream).duration as f32,
                     });
                 }
                 AVMediaType::AVMEDIA_TYPE_DATA => {}

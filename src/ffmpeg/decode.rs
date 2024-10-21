@@ -2,10 +2,9 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::ptr;
 
-use crate::ffmpeg::MediaPayload;
 use anyhow::Error;
 use ffmpeg_sys_the_third::AVPictureType::AV_PICTURE_TYPE_NONE;
-use ffmpeg_sys_the_third::{av_frame_alloc, avcodec_alloc_context3, avcodec_find_decoder, avcodec_free_context, avcodec_get_name, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, AVCodec, AVCodecContext, AVPacket, AVStream, AVERROR, AVERROR_EOF};
+use ffmpeg_sys_the_third::{av_frame_alloc, avcodec_alloc_context3, avcodec_find_decoder, avcodec_free_context, avcodec_get_name, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, AVCodec, AVCodecContext, AVFrame, AVPacket, AVStream, AVERROR, AVERROR_EOF};
 
 struct CodecContext {
     pub context: *mut AVCodecContext,
@@ -43,7 +42,7 @@ impl Decoder {
         &mut self,
         pkt: *mut AVPacket,
         stream: *mut AVStream,
-    ) -> Result<Vec<MediaPayload>, Error> {
+    ) -> Result<Vec<(*mut AVFrame, *mut AVStream)>, Error> {
         let stream_index = (*pkt).stream_index;
         assert_eq!(
             stream_index,
@@ -97,18 +96,11 @@ impl Decoder {
                 }
 
                 (*frame).pict_type = AV_PICTURE_TYPE_NONE; // encoder prints warnings
-                pkgs.push(MediaPayload::AvFrame(
-                    frame,
-                    stream,
-                ));
+                pkgs.push((frame, stream,));
             }
             Ok(pkgs)
         } else {
             Ok(vec![])
         }
-    }
-
-    pub fn process(&mut self, pkt: *mut AVPacket, stream: *mut AVStream) -> Result<Vec<MediaPayload>, Error> {
-        unsafe { self.decode_pkt(pkt, stream) }
     }
 }

@@ -1,10 +1,10 @@
 use crate::ffmpeg::get_ffmpeg_error_msg;
 use crate::return_ffmpeg_error;
 use anyhow::Error;
-use ffmpeg_sys_the_third::{av_channel_layout_default, av_frame_alloc, av_frame_free, swr_alloc_set_opts2, swr_convert_frame, swr_init, AVChannelLayout, AVFrame, AVSampleFormat, SwrContext};
+use ffmpeg_sys_the_third::{av_channel_layout_default, av_frame_alloc, av_frame_copy_props, av_frame_free, swr_alloc_set_opts2, swr_convert_frame, swr_init, AVChannelLayout, AVFrame, AVSampleFormat, SwrContext};
+use libc::malloc;
 use std::mem::transmute;
 use std::ptr;
-use libc::malloc;
 
 pub struct Resample {
     format: AVSampleFormat,
@@ -53,8 +53,11 @@ impl Resample {
         self.setup_swr(frame)?;
 
         let mut out_frame = av_frame_alloc();
+        av_frame_copy_props(out_frame, frame);
         (*out_frame).sample_rate = self.sample_rate as libc::c_int;
         (*out_frame).format = transmute(self.format);
+        (*out_frame).time_base = (*frame).time_base;
+
         av_channel_layout_default(&mut (*out_frame).ch_layout, self.channels as libc::c_int);
 
         let ret = swr_convert_frame(self.ctx, out_frame, frame);

@@ -5,7 +5,7 @@ use egui::load::SizedTexture;
 use egui::{vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Rounding, Sense, Shadow, Spinner, TextureHandle, TextureOptions, Ui, Vec2};
 
 use crate::ffmpeg::{DemuxerInfo, MediaPlayer};
-use ffmpeg_sys_the_third::{AVMediaType, AVRational};
+use ffmpeg_sys_the_third::AVMediaType;
 use ringbuf::consumer::Consumer;
 use ringbuf::producer::Producer;
 use ringbuf::storage::Heap;
@@ -25,9 +25,49 @@ enum PlayerMessage {
 pub enum DecoderMessage {
     MediaInfo(DemuxerInfo),
     /// Video frame from the decoder
-    VideoFrame(ColorImage),
+    VideoFrame(i64, i64, ColorImage),
     /// Audio samples from the decoder
-    AudioSamples(Vec<f32>),
+    AudioSamples(i64, i64, Vec<f32>),
+}
+
+impl DecoderMessage {
+    pub fn pts(&self) -> i64 {
+        match self {
+            DecoderMessage::AudioSamples(pts, _, _) => *pts,
+            DecoderMessage::VideoFrame(pts, _, _) => *pts,
+            _ => 0
+        }
+    }
+}
+
+impl PartialEq<Self> for DecoderMessage {
+    fn eq(&self, other: &Self) -> bool {
+        other.cmp(self).is_eq()
+    }
+}
+
+impl Eq for DecoderMessage {}
+
+impl Ord for DecoderMessage {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let pts_a = match self {
+            DecoderMessage::AudioSamples(pts, _, _) => *pts,
+            DecoderMessage::VideoFrame(pts, _, _) => *pts,
+            _ => 0
+        };
+        let pts_b = match other {
+            DecoderMessage::AudioSamples(pts, _, _) => *pts,
+            DecoderMessage::VideoFrame(pts, _, _) => *pts,
+            _ => 0
+        };
+        pts_b.cmp(&pts_a)
+    }
+}
+
+impl PartialOrd for DecoderMessage {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 /// Configurable aspects of a [`Player`].
@@ -61,10 +101,10 @@ pub struct Player {
     texture_handle: TextureHandle,
     options: PlayerOptions,
 
-    /// Current PTS
-    pts: i64,
-    /// Timebase of the video stream
-    timebase: AVRational,
+    /// Next PTS
+    next_pts: Option<i64>,
+    /// Stream info
+    info: Option<DemuxerInfo>,
 
     ctx: egui::Context,
     input_path: String,
@@ -99,19 +139,30 @@ pub enum PlayerState {
     Restarting,
 }
 
+pub trait PlayerOverlay {
+    fn overlay(&self, ui: &mut Ui) -> Response;
+}
 
 impl Player {
     /// The elapsed duration of the stream in seconds
     pub fn elapsed(&self) -> f32 {
-        self.pts as f32 * (self.timebase.num as f32 / self.timebase.den as f32)
+        // timebase is always 90k
+        self.next_pts.unwrap_or(0) as f32 * (1.0 / 90_000.0)
+    }
+
+    pub fn duration(&self) -> f32 {
+        self.info.as_ref().map_or(None, |i| i.best_video())
+            .map_or(0.0, |i| i.duration)
     }
 
     pub fn framerate(&self) -> f32 {
-        0.0
+        self.info.as_ref().map_or(None, |i| i.best_video())
+            .map_or(0.0, |i| i.fps)
     }
 
     pub fn size(&self) -> (u16, u16) {
-        (0, 0)
+        self.info.as_ref().map_or(None, |i| i.best_video())
+            .map_or((0, 0), |i| (i.width as u16, i.height as u16))
     }
 
     pub fn state(&self) -> PlayerState {
@@ -141,6 +192,7 @@ impl Player {
     /// Start the stream.
     pub fn start(&mut self) {
         self.media_player.start();
+        self.player_state = PlayerState::Playing;
     }
 
     pub fn set_volume(&mut self, volume: u8) {
@@ -186,12 +238,16 @@ impl Player {
     }
 
     fn process_state(&mut self, size: Vec2) {
-        for msg in self.media_player.next(&self.ctx, size) {
+        while let Some(msg) = self.media_player.next(size) {
             match msg {
-                DecoderMessage::VideoFrame(f) => {
-                    self.texture_handle.set(f, self.options.texture_options);
+                DecoderMessage::MediaInfo(i) => {
+                    self.info = Some(i);
                 }
-                DecoderMessage::AudioSamples(s) => {
+                DecoderMessage::VideoFrame(pts, duration, f) => {
+                    self.texture_handle.set(f, self.options.texture_options);
+                    self.next_pts = Some(self.next_pts.unwrap_or(pts) + duration);
+                }
+                DecoderMessage::AudioSamples(pts, duration, s) => {
                     if let Some(a) = self.audio.as_mut() {
                         a.tx.push_slice(&s);
                     }
@@ -389,7 +445,7 @@ impl Player {
         ui.painter().text(
             duration_text_pos,
             Align2::LEFT_BOTTOM,
-            format!("{}/{}", self.elapsed(), 0),
+            format!("{:.0}/{:.0}", self.elapsed(), self.duration()),
             duration_text_font_id,
             text_color,
         );
@@ -629,18 +685,18 @@ impl Player {
 
         /// Open audio device
         let audio = Self::open_default_audio_stream(options.audio_volume.clone());
-        
+
 
         Self {
             input_path: input_path.clone(),
             texture_handle,
             player_state: PlayerState::Stopped,
             options,
-            pts: 0,
-            timebase: AVRational { num: 0, den: 1 },
+            next_pts: None,
+            info: None,
             ctx: ctx.clone(),
             audio,
-            media_player: MediaPlayer::new(input_path),
+            media_player: MediaPlayer::new(input_path, ctx),
         }
     }
 }

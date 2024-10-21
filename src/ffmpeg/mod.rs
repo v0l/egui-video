@@ -2,14 +2,15 @@ use crate::ffmpeg::decode::Decoder;
 use crate::ffmpeg::demux::Demuxer;
 use crate::DecoderMessage;
 use egui::{Color32, ColorImage, Vec2};
-use egui_inbox::{UiInbox, UiInboxSender};
-use ffmpeg_sys_the_third::{av_frame_free, av_make_error_string, av_packet_free, av_sample_fmt_is_planar, AVFrame, AVMediaType, AVPacket, AVPixelFormat, AVSampleFormat, AVStream};
+use ffmpeg_sys_the_third::{av_frame_free, av_make_error_string, av_packet_free, av_q2d, av_rescale_q, av_sample_fmt_is_planar, AVFrame, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat, AVStream};
+use std::collections::BinaryHeap;
 use std::ffi::CStr;
 use std::mem::transmute;
 use std::slice;
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Instant;
 
 mod demux;
 mod decode;
@@ -19,29 +20,6 @@ mod resample;
 use crate::ffmpeg::resample::Resample;
 use crate::ffmpeg::scale::Scaler;
 pub use demux::DemuxerInfo;
-
-pub enum MediaPayload {
-    Flush,
-    MediaInfo(DemuxerInfo),
-    AvPacket(*mut AVPacket, *mut AVStream),
-    AvFrame(*mut AVFrame, *mut AVStream),
-}
-
-unsafe impl Send for MediaPayload {}
-
-impl Drop for MediaPayload {
-    fn drop(&mut self) {
-        match self {
-            MediaPayload::AvPacket(pkt, _) => unsafe {
-                av_packet_free(pkt);
-            }
-            MediaPayload::AvFrame(frm, _) => unsafe {
-                av_frame_free(frm);
-            }
-            _ => {}
-        }
-    }
-}
 
 #[macro_export]
 macro_rules! return_ffmpeg_error {
@@ -84,27 +62,36 @@ unsafe fn video_frame_to_image(frame: *const AVFrame) -> ColorImage {
 pub struct MediaPlayer {
     input: String,
     thread: Option<JoinHandle<()>>,
-    inbox: UiInbox<DecoderMessage>,
 
+    ctx: egui::Context,
     target_height: Arc<AtomicU16>,
     target_width: Arc<AtomicU16>,
+
+    media_queue: Arc<Mutex<BinaryHeap<DecoderMessage>>>,
 }
 
 impl MediaPlayer {
-    pub fn new(input: &str) -> Self {
+    pub fn new(input: &str, ctx: &egui::Context) -> Self {
         Self {
             input: input.to_string(),
             thread: None,
-            inbox: UiInbox::new(),
+            ctx: ctx.clone(),
             target_width: Arc::new(AtomicU16::new(0)),
             target_height: Arc::new(AtomicU16::new(0)),
+            media_queue: Arc::new(Mutex::new(BinaryHeap::new())),
         }
     }
 
-    pub fn next(&mut self, ctx: &egui::Context, size: Vec2) -> impl Iterator<Item=DecoderMessage> {
+    pub fn next(&mut self, size: Vec2) -> Option<DecoderMessage> {
+        // update target size
         self.target_height.store(size.y as u16, Ordering::Relaxed);
         self.target_width.store(size.x as u16, Ordering::Relaxed);
-        self.inbox.read(ctx)
+
+        if let Ok(mut q) = self.media_queue.lock() {
+            q.pop()
+        } else {
+            None
+        }
     }
 
     pub fn start(&mut self) {
@@ -112,15 +99,17 @@ impl MediaPlayer {
             return;
         }
         let input = self.input.clone();
-        let tx = self.inbox.sender();
+        let tx = self.media_queue.clone();
         let width = self.target_width.clone();
         let height = self.target_height.clone();
+        let ctx = self.ctx.clone();
         self.thread = Some(std::thread::spawn(move || {
             let mut probed: Option<DemuxerInfo> = None;
             let mut demux = Demuxer::new(&input);
             let mut decode = Decoder::new();
             let mut scale: Option<Scaler> = None;
             let mut resample: Option<Resample> = None;
+            let start = Instant::now();
 
             unsafe {
                 loop {
@@ -129,7 +118,10 @@ impl MediaPlayer {
                         match demux.probe_input() {
                             Ok(p) => {
                                 probed = Some(p.clone());
-                                tx.send(DecoderMessage::MediaInfo(p)).unwrap();
+                                if let Ok(mut q) = tx.lock() {
+                                    q.push(DecoderMessage::MediaInfo(p));
+                                    ctx.request_repaint();
+                                }
                             }
                             Err(e) => {
                                 panic!("{}", e);
@@ -156,19 +148,34 @@ impl MediaPlayer {
                         av_packet_free(&mut pkt);
                         continue;
                     }
-                    if let Ok(frames) = decode.process(pkt, stream) {
+
+                    if let Ok(mut frames) = decode.decode_pkt(pkt, stream) {
                         let width = width.load(Ordering::Relaxed);
                         let height = height.load(Ordering::Relaxed);
-                        for frame in frames {
+                        frames.sort_by(|a, b| (*a.0).pts.cmp(&(*b.0).pts));
+                        for (mut frame, stream) in frames {
                             Self::process_frame(
                                 &tx,
                                 frame,
+                                stream,
                                 scale.as_mut().unwrap(),
                                 resample.as_mut().unwrap(),
                                 width, height,
                             );
+
+                            let duration = (Instant::now() - start).as_secs_f64();
+                            let pts_duration = (*frame).pts as f64 * av_q2d((*stream).time_base) as f64;
+                            if pts_duration > duration {
+                                // sleep until ready to display frame
+                                let sleep_for = pts_duration - duration;
+                                std::thread::sleep(std::time::Duration::from_secs_f64(sleep_for));
+                            }
+
+                            av_frame_free(&mut frame);
                         }
                     }
+
+                    ctx.request_repaint();
                     av_packet_free(&mut pkt);
                 }
             }
@@ -177,35 +184,47 @@ impl MediaPlayer {
 
     /// Send decoded frames to player
     unsafe fn process_frame(
-        tx: &UiInboxSender<DecoderMessage>,
-        frame: MediaPayload,
+        tx: &Arc<Mutex<BinaryHeap<DecoderMessage>>>,
+        frame: *mut AVFrame,
+        stream: *mut AVStream,
         scale: &mut Scaler,
         resample: &mut Resample,
         width: u16,
         height: u16,
     ) {
-        if let MediaPayload::AvFrame(frm, stream) = frame { unsafe {
+        unsafe {
+            let tbn = AVRational { num: 1, den: 90_000 };
             if (*(*stream).codecpar).codec_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
-                match scale.process_frame(frm, width, height) {
-                    Ok(frame) => {
+                match scale.process_frame(frame, width, height) {
+                    Ok(mut frame) => {
+                        let pts = av_rescale_q((*frame).pts, (*stream).time_base, tbn);
+                        let duration = av_rescale_q((*frame).duration, (*stream).time_base, tbn);
                         let image = video_frame_to_image(frame);
-                        tx.send(DecoderMessage::VideoFrame(image)).unwrap();
+                        if let Ok(mut q) = tx.lock() {
+                            q.push(DecoderMessage::VideoFrame(pts, duration, image));
+                        }
+                        av_frame_free(&mut frame);
                     }
                     Err(e) => panic!("{}", e)
                 }
             } else if (*(*stream).codecpar).codec_type == AVMediaType::AVMEDIA_TYPE_AUDIO {
-                match resample.process_frame(frm) {
-                    Ok(frame) => {
+                match resample.process_frame(frame) {
+                    Ok(mut frame) => {
                         let is_planar = av_sample_fmt_is_planar(transmute((*frame).format)) == 1;
                         let plane_mul = if is_planar { 1 } else { (*frame).ch_layout.nb_channels };
                         let size = ((*frame).nb_samples * plane_mul) as usize;
+                        let pts = av_rescale_q((*frame).pts, (*stream).time_base, tbn);
+                        let duration = av_rescale_q((*frame).duration, (*stream).time_base, tbn);
 
                         let samples = slice::from_raw_parts((*frame).data[0] as *const f32, size);
-                        tx.send(DecoderMessage::AudioSamples(samples.to_vec())).unwrap();
+                        if let Ok(mut q) = tx.lock() {
+                            q.push(DecoderMessage::AudioSamples(pts, duration, samples.to_vec()));
+                        }
+                        av_frame_free(&mut frame);
                     }
                     Err(e) => panic!("{}", e)
                 }
             }
-        } }
+        }
     }
 }
