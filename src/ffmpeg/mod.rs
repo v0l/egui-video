@@ -7,10 +7,10 @@ use std::collections::BinaryHeap;
 use std::ffi::CStr;
 use std::mem::transmute;
 use std::slice;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod demux;
 mod decode;
@@ -66,8 +66,21 @@ pub struct MediaPlayer {
     ctx: egui::Context,
     target_height: Arc<AtomicU16>,
     target_width: Arc<AtomicU16>,
+    pts_max: Arc<AtomicI64>,
+    running: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 
     media_queue: Arc<Mutex<BinaryHeap<DecoderMessage>>>,
+    pub tbn: AVRational,
+}
+
+impl Drop for MediaPlayer {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+    }
 }
 
 impl MediaPlayer {
@@ -78,8 +91,16 @@ impl MediaPlayer {
             ctx: ctx.clone(),
             target_width: Arc::new(AtomicU16::new(0)),
             target_height: Arc::new(AtomicU16::new(0)),
+            pts_max: Arc::new(AtomicI64::new(0)),
+            running: Arc::new(AtomicBool::new(true)),
+            paused: Arc::new(AtomicBool::new(false)),
             media_queue: Arc::new(Mutex::new(BinaryHeap::new())),
+            tbn: AVRational { num: 1, den: 90_000 },
         }
+    }
+
+    pub fn pts_max(&self) -> i64 {
+        self.pts_max.load(Ordering::Relaxed)
     }
 
     pub fn next(&mut self, size: Vec2) -> Option<DecoderMessage> {
@@ -88,10 +109,35 @@ impl MediaPlayer {
         self.target_width.store(size.x as u16, Ordering::Relaxed);
 
         if let Ok(mut q) = self.media_queue.lock() {
+            if let [head, .., tail] = q.as_slice() {
+                let size = tail.pts() - head.pts();
+                if size < (self.tbn.den / 2) as i64 {
+                    return None;
+                }
+            }
             q.pop()
         } else {
             None
         }
+    }
+
+    pub fn set_paused(&mut self, p: bool) {
+        self.paused.store(p, Ordering::Relaxed);
+    }
+
+    pub fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.join().unwrap();
+        }
+        self.thread = None;
+    }
+
+    /// Get the number of seconds offset from realtime playback
+    unsafe fn pts_sync(start: Instant, pts: i64, tbn: AVRational) -> f64 {
+        let duration = (Instant::now() - start).as_secs_f64();
+        let pts_duration = pts as f64 * av_q2d(tbn) as f64;
+        pts_duration - duration
     }
 
     pub fn start(&mut self) {
@@ -103,16 +149,25 @@ impl MediaPlayer {
         let width = self.target_width.clone();
         let height = self.target_height.clone();
         let ctx = self.ctx.clone();
+        let max_pts = self.pts_max.clone();
+        let tbn = self.tbn.clone();
+        let running = self.running.clone();
+        let paused = self.paused.clone();
         self.thread = Some(std::thread::spawn(move || {
+            running.store(true, Ordering::Relaxed);
             let mut probed: Option<DemuxerInfo> = None;
             let mut demux = Demuxer::new(&input);
             let mut decode = Decoder::new();
             let mut scale: Option<Scaler> = None;
             let mut resample: Option<Resample> = None;
-            let start = Instant::now();
+            let mut start = Instant::now();
+            let mut last_pts = 0;
 
             unsafe {
                 loop {
+                    if !running.load(Ordering::Relaxed) {
+                        break;
+                    }
                     // wait until probe result
                     if probed.as_ref().is_none() {
                         match demux.probe_input() {
@@ -142,6 +197,14 @@ impl MediaPlayer {
                         ))
                     }
 
+                    let buf_size = Self::pts_sync(start, max_pts.load(Ordering::Relaxed), tbn);
+                    if buf_size > 2.0 || paused.load(Ordering::Relaxed) {
+                        std::thread::sleep(Duration::from_millis(5));
+                        //move start timestamp when pausing
+                        start = Instant::now() - Duration::from_secs_f64(last_pts as f64 * av_q2d(tbn) as f64);
+                        continue;
+                    }
+
                     // read frames
                     let (mut pkt, stream) = demux.get_packet().expect("failed to get packet");
                     if !probed.as_ref().unwrap().is_best_stream(stream) {
@@ -156,6 +219,7 @@ impl MediaPlayer {
                         for (mut frame, stream) in frames {
                             Self::process_frame(
                                 &tx,
+                                &tbn,
                                 frame,
                                 stream,
                                 scale.as_mut().unwrap(),
@@ -163,12 +227,21 @@ impl MediaPlayer {
                                 width, height,
                             );
 
-                            let duration = (Instant::now() - start).as_secs_f64();
-                            let pts_duration = (*frame).pts as f64 * av_q2d((*stream).time_base) as f64;
-                            if pts_duration > duration {
-                                // sleep until ready to display frame
-                                let sleep_for = pts_duration - duration;
-                                std::thread::sleep(std::time::Duration::from_secs_f64(sleep_for));
+                            // sleep until ready to display frame
+                            if (*(*stream).codecpar).codec_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
+                                let f_pts = av_rescale_q((*frame).pts - (*stream).start_time, (*stream).time_base, tbn);
+                                let diff = Self::pts_sync(start, f_pts, tbn);
+                                if diff > 0.0 {
+                                    std::thread::sleep(Duration::from_secs_f64(diff));
+                                }
+
+                                last_pts = max_pts.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                                    if v < f_pts {
+                                        Some(f_pts)
+                                    } else {
+                                        None
+                                    }
+                                }).unwrap_or(last_pts);
                             }
 
                             av_frame_free(&mut frame);
@@ -185,6 +258,7 @@ impl MediaPlayer {
     /// Send decoded frames to player
     unsafe fn process_frame(
         tx: &Arc<Mutex<BinaryHeap<DecoderMessage>>>,
+        tbn: &AVRational,
         frame: *mut AVFrame,
         stream: *mut AVStream,
         scale: &mut Scaler,
@@ -193,12 +267,11 @@ impl MediaPlayer {
         height: u16,
     ) {
         unsafe {
-            let tbn = AVRational { num: 1, den: 90_000 };
             if (*(*stream).codecpar).codec_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
                 match scale.process_frame(frame, width, height) {
                     Ok(mut frame) => {
-                        let pts = av_rescale_q((*frame).pts, (*stream).time_base, tbn);
-                        let duration = av_rescale_q((*frame).duration, (*stream).time_base, tbn);
+                        let pts = av_rescale_q((*frame).pts - (*stream).start_time, (*stream).time_base, *tbn);
+                        let duration = av_rescale_q((*frame).duration, (*stream).time_base, *tbn);
                         let image = video_frame_to_image(frame);
                         if let Ok(mut q) = tx.lock() {
                             q.push(DecoderMessage::VideoFrame(pts, duration, image));
@@ -213,8 +286,8 @@ impl MediaPlayer {
                         let is_planar = av_sample_fmt_is_planar(transmute((*frame).format)) == 1;
                         let plane_mul = if is_planar { 1 } else { (*frame).ch_layout.nb_channels };
                         let size = ((*frame).nb_samples * plane_mul) as usize;
-                        let pts = av_rescale_q((*frame).pts, (*stream).time_base, tbn);
-                        let duration = av_rescale_q((*frame).duration, (*stream).time_base, tbn);
+                        let pts = av_rescale_q((*frame).pts - (*stream).start_time, (*stream).time_base, *tbn);
+                        let duration = av_rescale_q((*frame).duration, (*stream).time_base, *tbn);
 
                         let samples = slice::from_raw_parts((*frame).data[0] as *const f32, size);
                         if let Ok(mut q) = tx.lock() {
@@ -225,8 +298,8 @@ impl MediaPlayer {
                     Err(e) => panic!("{}", e)
                 }
             } else if (*(*stream).codecpar).codec_type == AVMediaType::AVMEDIA_TYPE_SUBTITLE {
-                let pts = av_rescale_q((*frame).pts, (*stream).time_base, tbn);
-                let duration = av_rescale_q((*frame).duration, (*stream).time_base, tbn);
+                let pts = av_rescale_q((*frame).pts - (*stream).start_time, (*stream).time_base, *tbn);
+                let duration = av_rescale_q((*frame).duration, (*stream).time_base, *tbn);
                 let str: &[u8] = slice::from_raw_parts((*frame).data[0], (*frame).linesize[0] as usize);
                 let str = String::from_utf8_lossy(str).to_string();
                 if let Ok(mut q) = tx.lock() {

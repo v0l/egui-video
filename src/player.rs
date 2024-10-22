@@ -243,14 +243,14 @@ impl PlayerControls for PlayerOverlayState {
 }
 
 pub trait PlayerOverlay {
-    fn show(&self, ui: &mut Ui, state: &mut PlayerOverlayState);
+    fn show(&self, ui: &mut Ui, frame: &Response, state: &mut PlayerOverlayState);
 }
 
 impl<T> CustomPlayer<T>
 where
     T: PlayerOverlay,
 {
-    fn render_overlay(&mut self, ui: &mut Ui) {
+    fn render_overlay(&mut self, ui: &mut Ui, frame: &Response) {
         let inbox = UiInbox::new();
         let mut state = PlayerOverlayState {
             elapsed: self.elapsed(),
@@ -263,7 +263,7 @@ where
             state: self.state(),
             inbox: inbox.sender(),
         };
-        self.overlay.show(ui, &mut state);
+        self.overlay.show(ui, frame, &mut state);
 
         // drain inbox
         let r = inbox.read(ui);
@@ -334,9 +334,9 @@ where
         if let Some(s) = self.subtitle.as_ref() {
             ui.painter().text(
                 frame_response.rect.min + vec2(frame_response.rect.width() / 2.0, frame_response.rect.height() - 40.),
-                Align2::CENTER_TOP,
+                Align2::CENTER_BOTTOM,
                 &s.text,
-                FontId::proportional(13.),
+                FontId::proportional(16.),
                 Color32::WHITE,
             );
         }
@@ -356,13 +356,21 @@ where
         painter.galley(bg_pos.min + vec_padding, galley, Color32::PLACEHOLDER);
     }
 
+    fn pts_to_sec(&self, pts: i64) -> f32 {
+        pts as f32 * (self.media_player.tbn.num as f32 / self.media_player.tbn.den as f32)
+    }
+
     fn debug_inner(&mut self) -> LayoutJob {
-        let v_pts = self.pts_video.load(Ordering::Relaxed);
-        let a_pts = self.pts_audio.load(Ordering::Relaxed);
+        let v_pts = self.pts_to_sec(self.pts_video.load(Ordering::Relaxed));
+        let a_pts = self.pts_to_sec(self.pts_audio.load(Ordering::Relaxed));
         let font = TextFormat::simple(FontId::monospace(11.), Color32::WHITE);
 
         let mut layout = LayoutJob::default();
-        layout.append(&format!("Sync: v:{}, a:{}, sync:{}", v_pts, a_pts, v_pts - a_pts), 0.0, font.clone());
+        layout.append(&format!("sync: v:{:.3}s, a:{:.3}s, a-sync:{:.3}s", v_pts, a_pts, v_pts - a_pts), 0.0, font.clone());
+
+        let max_pts = self.pts_to_sec(self.media_player.pts_max());
+        let buf_len = if max_pts != 0.0 { max_pts - v_pts } else { 0.0 };
+        layout.append(&format!("\nbuffer: {:.3}s", buf_len), 0.0, font.clone());
 
         let bv = self.info.as_ref().and_then(|i| i.best_video());
         if let Some(bv) = bv {
@@ -478,6 +486,7 @@ where
     /// Pause the stream.
     fn pause(&mut self) {
         self.player_state = PlayerState::Paused;
+        self.media_player.set_paused(true);
     }
 
 
@@ -485,6 +494,7 @@ where
     fn start(&mut self) {
         self.media_player.start();
         self.player_state = PlayerState::Playing;
+        self.media_player.set_paused(false);
     }
 
     /// Stop the stream.
@@ -541,7 +551,7 @@ where
         self.process_state(size);
         let frame_response = self.render_frame(ui);
         self.render_subtitles(ui, &frame_response);
-        self.render_overlay(ui);
+        self.render_overlay(ui, &frame_response);
         if self.debug {
             self.render_debug(ui, &frame_response);
         }

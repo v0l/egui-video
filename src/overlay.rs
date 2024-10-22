@@ -1,12 +1,11 @@
 use crate::{PlayerControls, PlayerOverlay, PlayerOverlayState, PlayerState};
-use egui::{vec2, Align2, Color32, FontId, Rect, Rounding, Sense, Shadow, Spinner, Ui, Vec2};
+use egui::{vec2, Align2, Color32, FontId, Rect, Response, Rounding, Sense, Shadow, Spinner, Ui, Vec2};
 use ffmpeg_sys_the_third::AVMediaType;
 
 pub struct DefaultOverlay {}
 
 impl PlayerOverlay for DefaultOverlay {
-    fn show(&self, ui: &mut Ui, p: &mut PlayerOverlayState) {
-        let frame_response = ui.response();
+    fn show(&self, ui: &mut Ui, frame_response: &Response, p: &mut PlayerOverlayState) {
         let hovered = ui.rect_contains_pointer(frame_response.rect);
         let currently_seeking = matches!(p.state(), PlayerState::Seeking(_));
         let is_stopped = matches!(p.state(), PlayerState::Stopped);
@@ -25,7 +24,11 @@ impl PlayerOverlay for DefaultOverlay {
         let seekbar_width_offset = 20.;
         let fullseekbar_width = frame_response.rect.width() - seekbar_width_offset;
 
-        let seekbar_width = fullseekbar_width * p.elapsed();
+        let seekbar_width = fullseekbar_width * if p.duration() != 0.0 {
+            p.elapsed() / p.duration()
+        } else {
+            0.0
+        };
 
         let seekbar_offset = 20.;
         let seekbar_pos =
