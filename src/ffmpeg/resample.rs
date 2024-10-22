@@ -1,7 +1,11 @@
 use crate::ffmpeg::get_ffmpeg_error_msg;
 use crate::return_ffmpeg_error;
 use anyhow::Error;
-use ffmpeg_sys_the_third::{av_channel_layout_default, av_frame_alloc, av_frame_copy_props, av_frame_free, swr_alloc_set_opts2, swr_convert_frame, swr_init, AVChannelLayout, AVFrame, AVSampleFormat, SwrContext};
+use ffmpeg_sys_the_third::{
+    av_channel_layout_default, av_frame_alloc, av_frame_copy_props, av_frame_free,
+    swr_alloc_set_opts2, swr_convert_frame, swr_init, AVChannelLayout, AVFrame, AVSampleFormat,
+    SwrContext,
+};
 use libc::malloc;
 use std::mem::transmute;
 use std::ptr;

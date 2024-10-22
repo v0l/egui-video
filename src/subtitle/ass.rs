@@ -22,7 +22,10 @@ fn tuple_int_2(v: Vec<f64>) -> Result<(i64, i64)> {
 
 fn tuple_float_2(v: Vec<f64>) -> Result<(f64, f64)> {
     const FAIL_TEXT: &str = "invalid number of items";
-    Ok((*v.first().context(FAIL_TEXT)?, *v.get(1).context(FAIL_TEXT)?))
+    Ok((
+        *v.first().context(FAIL_TEXT)?,
+        *v.get(1).context(FAIL_TEXT)?,
+    ))
 }
 
 fn fad(i: &str) -> IResult<&str, SubtitleField> {
@@ -146,10 +149,7 @@ fn opt_comma(i: &str) -> IResult<&str, Option<char>> {
 }
 
 fn string_field(i: &str) -> IResult<&str, Option<String>> {
-    preceded(
-        opt_comma,
-        map(opt(not_comma), |s| s.map(String::from)),
-    )(i)
+    preceded(opt_comma, map(opt(not_comma), |s| s.map(String::from)))(i)
 }
 
 fn num_field(i: &str) -> IResult<&str, i32> {

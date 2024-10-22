@@ -6,15 +6,16 @@
 #![doc = include_str!("../examples/main.rs")]
 //! ```
 
-mod subtitle;
 mod audio;
-mod player;
-mod ffmpeg;
+pub mod ffmpeg;
 mod overlay;
+mod player;
+mod subtitle;
 
 use crate::overlay::DefaultOverlay;
 pub use audio::*;
 use egui::{Response, Ui, Widget};
+pub use ffmpeg_sys_the_third;
 pub use player::*;
 
 pub struct Player {
@@ -24,7 +25,7 @@ pub struct Player {
 impl Player {
     pub fn new(ctx: &egui::Context, input_path: &String) -> Self {
         Self {
-            inner: CustomPlayer::new(DefaultOverlay {}, ctx, input_path)
+            inner: CustomPlayer::new(DefaultOverlay {}, ctx, input_path),
         }
     }
 }

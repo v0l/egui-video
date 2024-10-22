@@ -2,7 +2,10 @@ use crate::AudioDevice;
 use cpal::traits::DeviceTrait;
 use cpal::{Stream, SupportedStreamConfig};
 use egui::load::SizedTexture;
-use egui::{vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Sense, TextFormat, TextureHandle, Ui, Vec2, Widget};
+use egui::{
+    vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Sense, TextFormat,
+    TextureHandle, Ui, Vec2, Widget,
+};
 
 use crate::ffmpeg::{DemuxerInfo, MediaPlayer};
 use crate::subtitle::Subtitle;
@@ -50,7 +53,7 @@ impl DecoderMessage {
         match self {
             DecoderMessage::AudioSamples(pts, _, _) => *pts,
             DecoderMessage::VideoFrame(pts, _, _) => *pts,
-            _ => 0
+            _ => 0,
         }
     }
 }
@@ -68,12 +71,12 @@ impl Ord for DecoderMessage {
         let pts_a = match self {
             DecoderMessage::AudioSamples(pts, _, _) => *pts,
             DecoderMessage::VideoFrame(pts, _, _) => *pts,
-            _ => 0
+            _ => 0,
         };
         let pts_b = match other {
             DecoderMessage::AudioSamples(pts, _, _) => *pts,
             DecoderMessage::VideoFrame(pts, _, _) => *pts,
-            _ => 0
+            _ => 0,
         };
         pts_b.cmp(&pts_a)
     }
@@ -194,15 +197,21 @@ impl PlayerControls for PlayerOverlayState {
     }
 
     fn pause(&mut self) {
-        self.inbox.send(PlayerMessage::SetState(PlayerState::Paused)).unwrap();
+        self.inbox
+            .send(PlayerMessage::SetState(PlayerState::Paused))
+            .unwrap();
     }
 
     fn start(&mut self) {
-        self.inbox.send(PlayerMessage::SetState(PlayerState::Playing)).unwrap();
+        self.inbox
+            .send(PlayerMessage::SetState(PlayerState::Playing))
+            .unwrap();
     }
 
     fn stop(&mut self) {
-        self.inbox.send(PlayerMessage::SetState(PlayerState::Stopped)).unwrap();
+        self.inbox
+            .send(PlayerMessage::SetState(PlayerState::Stopped))
+            .unwrap();
     }
 
     fn seek(&mut self, seek: f32) {
@@ -222,7 +231,9 @@ impl PlayerControls for PlayerOverlayState {
     }
 
     fn set_volume_f32(&mut self, volume: f32) {
-        self.inbox.send(PlayerMessage::SetVolume((u8::MAX as f32 * volume) as u8)).unwrap();
+        self.inbox
+            .send(PlayerMessage::SetVolume((u8::MAX as f32 * volume) as u8))
+            .unwrap();
     }
 
     fn looping(&self) -> bool {
@@ -298,14 +309,12 @@ where
 
     fn process_player_message(&mut self, m: PlayerMessage) {
         match m {
-            PlayerMessage::SetState(s) => {
-                match s {
-                    PlayerState::Stopped => self.stop(),
-                    PlayerState::Paused => self.pause(),
-                    PlayerState::Playing => self.start(),
-                    _ => {}
-                }
-            }
+            PlayerMessage::SetState(s) => match s {
+                PlayerState::Stopped => self.stop(),
+                PlayerState::Paused => self.pause(),
+                PlayerState::Playing => self.start(),
+                _ => {}
+            },
             PlayerMessage::Seek(v) => {
                 self.seek(v);
             }
@@ -333,7 +342,11 @@ where
     fn render_subtitles(&mut self, ui: &mut Ui, frame_response: &Response) {
         if let Some(s) = self.subtitle.as_ref() {
             ui.painter().text(
-                frame_response.rect.min + vec2(frame_response.rect.width() / 2.0, frame_response.rect.height() - 40.),
+                frame_response.rect.min
+                    + vec2(
+                        frame_response.rect.width() / 2.0,
+                        frame_response.rect.height() - 40.,
+                    ),
                 Align2::CENTER_BOTTOM,
                 &s.text,
                 FontId::proportional(16.),
@@ -349,10 +362,15 @@ where
         let vec_padding = vec2(PADDING, PADDING);
         let job = self.debug_inner();
         let galley = painter.layout_job(job);
-        let mut bg_pos = galley.rect
+        let mut bg_pos = galley
+            .rect
             .translate(frame_response.rect.min.to_vec2() + vec_padding);
         bg_pos.max += vec_padding * 2.0;
-        painter.rect_filled(bg_pos, PADDING, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+        painter.rect_filled(
+            bg_pos,
+            PADDING,
+            Color32::from_rgba_unmultiplied(0, 0, 0, 150),
+        );
         painter.galley(bg_pos.min + vec_padding, galley, Color32::PLACEHOLDER);
     }
 
@@ -366,7 +384,16 @@ where
         let font = TextFormat::simple(FontId::monospace(11.), Color32::WHITE);
 
         let mut layout = LayoutJob::default();
-        layout.append(&format!("sync: v:{:.3}s, a:{:.3}s, a-sync:{:.3}s", v_pts, a_pts, v_pts - a_pts), 0.0, font.clone());
+        layout.append(
+            &format!(
+                "sync: v:{:.3}s, a:{:.3}s, a-sync:{:.3}s",
+                v_pts,
+                a_pts,
+                v_pts - a_pts
+            ),
+            0.0,
+            font.clone(),
+        );
 
         let max_pts = self.pts_to_sec(self.media_player.pts_max());
         let buf_len = if max_pts != 0.0 { max_pts - v_pts } else { 0.0 };
@@ -411,7 +438,9 @@ where
                     },
                     move |e| {
                         panic!("{}", e);
-                    }, None) {
+                    },
+                    None,
+                ) {
                     return Some(PlayerAudioStream {
                         device: a,
                         config: cfg,
@@ -427,8 +456,11 @@ where
 
     /// Create a new [`CustomPlayer`].
     pub fn new(overlay: T, ctx: &egui::Context, input_path: &String) -> Self {
-        let texture_handle =
-            ctx.load_texture("video_frame", ColorImage::new([1, 1], Color32::BLACK), Default::default());
+        let texture_handle = ctx.load_texture(
+            "video_frame",
+            ColorImage::new([1, 1], Color32::BLACK),
+            Default::default(),
+        );
 
         /// volume arc
         let vol = Arc::new(AtomicU8::new(255));
@@ -470,12 +502,16 @@ where
     }
 
     fn framerate(&self) -> f32 {
-        self.info.as_ref().and_then(|i| i.best_video())
+        self.info
+            .as_ref()
+            .and_then(|i| i.best_video())
             .map_or(0.0, |i| i.fps)
     }
 
     fn size(&self) -> (u16, u16) {
-        self.info.as_ref().and_then(|i| i.best_video())
+        self.info
+            .as_ref()
+            .and_then(|i| i.best_video())
             .map_or((0, 0), |i| (i.width as u16, i.height as u16))
     }
 
@@ -488,7 +524,6 @@ where
         self.player_state = PlayerState::Paused;
         self.media_player.set_paused(true);
     }
-
 
     /// Start the stream.
     fn start(&mut self) {

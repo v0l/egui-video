@@ -1,5 +1,7 @@
 use crate::{PlayerControls, PlayerOverlay, PlayerOverlayState, PlayerState};
-use egui::{vec2, Align2, Color32, FontId, Rect, Response, Rounding, Sense, Shadow, Spinner, Ui, Vec2};
+use egui::{
+    vec2, Align2, Color32, FontId, Rect, Response, Rounding, Sense, Shadow, Spinner, Ui, Vec2,
+};
 use ffmpeg_sys_the_third::AVMediaType;
 
 pub struct DefaultOverlay {}
@@ -24,11 +26,12 @@ impl PlayerOverlay for DefaultOverlay {
         let seekbar_width_offset = 20.;
         let fullseekbar_width = frame_response.rect.width() - seekbar_width_offset;
 
-        let seekbar_width = fullseekbar_width * if p.duration() != 0.0 {
-            p.elapsed() / p.duration()
-        } else {
-            0.0
-        };
+        let seekbar_width = fullseekbar_width
+            * if p.duration() != 0.0 {
+                p.elapsed() / p.duration()
+            } else {
+                0.0
+            };
 
         let seekbar_offset = 20.;
         let seekbar_pos =
@@ -226,14 +229,8 @@ impl PlayerOverlay for DefaultOverlay {
 
             let mut draw_row = |stream_type: AVMediaType| {
                 let text = match stream_type {
-                    AVMediaType::AVMEDIA_TYPE_AUDIO => format!(
-                        "{} {}/{}",
-                        sound_icon, 1, 1
-                    ),
-                    AVMediaType::AVMEDIA_TYPE_SUBTITLE => format!(
-                        "{} {}/{}",
-                        subtitle_icon, 1, 1
-                    ),
+                    AVMediaType::AVMEDIA_TYPE_AUDIO => format!("{} {}/{}", sound_icon, 1, 1),
+                    AVMediaType::AVMEDIA_TYPE_SUBTITLE => format!("{} {}/{}", subtitle_icon, 1, 1),
                     _ => unreachable!(),
                 };
 
@@ -360,10 +357,9 @@ impl PlayerOverlay for DefaultOverlay {
         if sound_anim_frac > 0. && sound_slider_resp.clicked() || sound_slider_resp.dragged() {
             if let Some(hover_pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
                 let sound_frac = 1.
-                    - ((hover_pos - sound_slider_rect.left_top()).y
-                    / sound_slider_rect.height())
-                    .max(0.)
-                    .min(1.);
+                    - ((hover_pos - sound_slider_rect.left_top()).y / sound_slider_rect.height())
+                        .max(0.)
+                        .min(1.);
                 p.set_volume_f32(sound_frac);
             }
         }

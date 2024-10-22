@@ -4,7 +4,10 @@ use std::ptr;
 
 use crate::return_ffmpeg_error;
 use anyhow::Error;
-use ffmpeg_sys_the_third::{av_frame_alloc, av_frame_copy_props, sws_freeContext, sws_getContext, sws_scale_frame, AVFrame, AVPixelFormat, SwsContext, SWS_BILINEAR};
+use ffmpeg_sys_the_third::{
+    av_frame_alloc, av_frame_copy_props, sws_freeContext, sws_getContext, sws_scale_frame, AVFrame,
+    AVPixelFormat, SwsContext, SWS_BILINEAR,
+};
 
 pub struct Scaler {
     width: u16,
@@ -36,7 +39,12 @@ impl Scaler {
         }
     }
 
-    unsafe fn setup_scaler(&mut self, frame: *const AVFrame, width: u16, height: u16) -> Result<(), Error> {
+    unsafe fn setup_scaler(
+        &mut self,
+        frame: *const AVFrame,
+        width: u16,
+        height: u16,
+    ) -> Result<(), Error> {
         if !self.ctx.is_null() && self.width == width && self.height == height {
             return Ok(());
         }

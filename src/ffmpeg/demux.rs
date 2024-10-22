@@ -22,13 +22,16 @@ unsafe impl Sync for DemuxerInfo {}
 
 impl DemuxerInfo {
     pub fn best_stream(&self, t: StreamChannelType) -> Option<&StreamInfoChannel> {
-        self.channels.iter().filter(|a| a.channel_type == t).reduce(|acc, channel| {
-            if channel.best_metric() > acc.best_metric() {
-                channel
-            } else {
-                acc
-            }
-        })
+        self.channels
+            .iter()
+            .filter(|a| a.channel_type == t)
+            .reduce(|acc, channel| {
+                if channel.best_metric() > acc.best_metric() {
+                    channel
+                } else {
+                    acc
+                }
+            })
     }
 
     pub fn best_video(&self) -> Option<&StreamInfoChannel> {
@@ -45,12 +48,16 @@ impl DemuxerInfo {
 
     pub unsafe fn is_best_stream(&self, stream: *mut AVStream) -> bool {
         match (*(*stream).codecpar).codec_type {
-            AVMediaType::AVMEDIA_TYPE_VIDEO =>
-                (*stream).index == self.best_video().map_or(usize::MAX, |r| r.index) as libc::c_int,
-            AVMediaType::AVMEDIA_TYPE_AUDIO =>
-                (*stream).index == self.best_audio().map_or(usize::MAX, |r| r.index) as libc::c_int,
-            AVMediaType::AVMEDIA_TYPE_SUBTITLE =>
-                (*stream).index == self.best_subtitle().map_or(usize::MAX, |r| r.index) as libc::c_int,
+            AVMediaType::AVMEDIA_TYPE_VIDEO => {
+                (*stream).index == self.best_video().map_or(usize::MAX, |r| r.index) as libc::c_int
+            }
+            AVMediaType::AVMEDIA_TYPE_AUDIO => {
+                (*stream).index == self.best_audio().map_or(usize::MAX, |r| r.index) as libc::c_int
+            }
+            AVMediaType::AVMEDIA_TYPE_SUBTITLE => {
+                (*stream).index
+                    == self.best_subtitle().map_or(usize::MAX, |r| r.index) as libc::c_int
+            }
             _ => false,
         }
     }
@@ -115,12 +122,17 @@ impl Display for StreamInfoChannel {
         write!(
             f,
             "{} #{}: codec={},size={}x{},fps={}",
-            self.channel_type, self.index, codec_name.to_str().unwrap(), self.width, self.height, self.fps
+            self.channel_type,
+            self.index,
+            codec_name.to_str().unwrap(),
+            self.width,
+            self.height,
+            self.fps
         )
     }
 }
 
-pub(crate) struct Demuxer {
+pub struct Demuxer {
     ctx: *mut AVFormatContext,
     input: String,
     started: Instant,

@@ -6,11 +6,7 @@ fn main() {
     let mut opt = NativeOptions::default();
     opt.viewport.inner_size = Some(vec2(640., 480.));
 
-    let _ = eframe::run_native(
-        "app",
-        opt,
-        Box::new(|_| Ok(Box::new(App::default()))),
-    );
+    let _ = eframe::run_native("app", opt, Box::new(|_| Ok(Box::new(App::default()))));
 }
 struct App {
     audio_device: AudioDevice,
@@ -53,8 +49,7 @@ impl eframe::App for App {
 
                 ui.add_sized(
                     [ui.available_width(), ui.available_height()],
-                    TextEdit::singleline(&mut self.media_path)
-                        .hint_text("click to set path"),
+                    TextEdit::singleline(&mut self.media_path).hint_text("click to set path"),
                 );
             });
             ui.separator();
