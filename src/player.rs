@@ -2,20 +2,34 @@ use crate::AudioDevice;
 use cpal::traits::DeviceTrait;
 use cpal::{Stream, SupportedStreamConfig};
 use egui::load::SizedTexture;
-use egui::{vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Rounding, Sense, Shadow, Spinner, TextureHandle, TextureOptions, Ui, Vec2};
+use egui::{vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Sense, TextFormat, TextureHandle, Ui, Vec2, Widget};
 
 use crate::ffmpeg::{DemuxerInfo, MediaPlayer};
+use crate::subtitle::Subtitle;
+use egui::text::LayoutJob;
+use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_sys_the_third::AVMediaType;
 use ringbuf::consumer::Consumer;
 use ringbuf::producer::Producer;
 use ringbuf::storage::Heap;
 use ringbuf::traits::Split;
 use ringbuf::{CachingProd, HeapRb, SharedRb};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::Arc;
 
+#[derive(Debug)]
 /// IPC for player
 enum PlayerMessage {
+    /// Set player state
+    SetState(PlayerState),
+    /// Seek to position in seconds
+    Seek(f32),
+    /// Set player volume
+    SetVolume(u8),
+    /// Set player looping
+    SetLooping(bool),
+    /// Set debug overlay
+    SetDebug(bool),
     /// Select playing stream
     SelectStream(AVMediaType, usize),
 }
@@ -28,6 +42,7 @@ pub enum DecoderMessage {
     VideoFrame(i64, i64, ColorImage),
     /// Audio samples from the decoder
     AudioSamples(i64, i64, Vec<f32>),
+    Subtitles(i64, i64, String),
 }
 
 impl DecoderMessage {
@@ -70,45 +85,30 @@ impl PartialOrd for DecoderMessage {
     }
 }
 
-/// Configurable aspects of a [`Player`].
-pub struct PlayerOptions {
-    /// Should the stream loop if it finishes?
-    pub looping: AtomicBool,
-    /// The volume of the audio stream.
-    pub audio_volume: Arc<AtomicU8>,
-    /// The maximum volume of the audio stream.
-    pub max_audio_volume: Arc<AtomicU8>,
-    /// The texture options for the displayed video frame.
-    pub texture_options: TextureOptions,
-}
-
-impl Default for PlayerOptions {
-    fn default() -> Self {
-        Self {
-            looping: AtomicBool::new(true),
-            max_audio_volume: Arc::new(AtomicU8::new(u8::MAX)),
-            audio_volume: Arc::new(AtomicU8::new(127)),
-            texture_options: TextureOptions::default(),
-        }
-    }
-}
-
-/// The [`Player`] processes and controls streams of video/audio.
+/// The [`CustomPlayer`] processes and controls streams of video/audio.
 /// This is what you use to show a video file.
-/// Initialize once, and use the [`Player::ui`] or [`Player::ui_at()`] functions to show the playback.
-pub struct Player {
+/// Initialize once, and use the [`CustomPlayer::ui`] or [`CustomPlayer::ui_at()`] functions to show the playback.
+pub struct CustomPlayer<T>
+where
+    T: PlayerOverlay,
+{
+    overlay: T,
     player_state: PlayerState,
     texture_handle: TextureHandle,
-    options: PlayerOptions,
+    looping: bool,
+    volume: Arc<AtomicU8>,
+    debug: bool,
 
     /// Next PTS
-    next_pts: Option<i64>,
+    pts_video: Arc<AtomicI64>,
+    pts_audio: Arc<AtomicI64>,
     /// Stream info
     info: Option<DemuxerInfo>,
 
     ctx: egui::Context,
     input_path: String,
     audio: Option<PlayerAudioStream>,
+    subtitle: Option<Subtitle>,
 
     /// ffmpeg media player
     media_player: MediaPlayer,
@@ -121,7 +121,7 @@ struct PlayerAudioStream {
     pub tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
 }
 
-/// The possible states of a [`Player`].
+/// The possible states of a [`CustomPlayer`].
 #[repr(u8)]
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum PlayerState {
@@ -139,121 +139,182 @@ pub enum PlayerState {
     Restarting,
 }
 
-pub trait PlayerOverlay {
-    fn overlay(&self, ui: &mut Ui) -> Response;
+pub trait PlayerControls {
+    fn elapsed(&self) -> f32;
+    fn duration(&self) -> f32;
+    fn framerate(&self) -> f32;
+    fn size(&self) -> (u16, u16);
+    fn state(&self) -> PlayerState;
+    fn pause(&mut self);
+    fn start(&mut self);
+    fn stop(&mut self);
+    fn seek(&mut self, seek_frac: f32);
+    fn set_volume(&mut self, volume: u8);
+    fn volume(&self) -> u8;
+    fn volume_f32(&self) -> f32;
+    fn set_volume_f32(&mut self, volume: f32);
+    fn looping(&self) -> bool;
+    fn set_looping(&mut self, looping: bool);
+    fn debug(&self) -> bool;
+    fn set_debug(&mut self, debug: bool);
 }
 
-impl Player {
-    /// The elapsed duration of the stream in seconds
-    pub fn elapsed(&self) -> f32 {
-        // timebase is always 90k
-        self.next_pts.unwrap_or(0) as f32 * (1.0 / 90_000.0)
+/// Wrapper to store player info and pass to overlay impl
+pub struct PlayerOverlayState {
+    elapsed: f32,
+    duration: f32,
+    framerate: f32,
+    size: (u16, u16),
+    volume: u8,
+    looping: bool,
+    debug: bool,
+    state: PlayerState,
+    inbox: UiInboxSender<PlayerMessage>,
+}
+
+impl PlayerControls for PlayerOverlayState {
+    fn elapsed(&self) -> f32 {
+        self.elapsed
     }
 
-    pub fn duration(&self) -> f32 {
-        self.info.as_ref().map_or(None, |i| i.best_video())
-            .map_or(0.0, |i| i.duration)
+    fn duration(&self) -> f32 {
+        self.duration
     }
 
-    pub fn framerate(&self) -> f32 {
-        self.info.as_ref().map_or(None, |i| i.best_video())
-            .map_or(0.0, |i| i.fps)
+    fn framerate(&self) -> f32 {
+        self.framerate
     }
 
-    pub fn size(&self) -> (u16, u16) {
-        self.info.as_ref().map_or(None, |i| i.best_video())
-            .map_or((0, 0), |i| (i.width as u16, i.height as u16))
+    fn size(&self) -> (u16, u16) {
+        self.size
     }
 
-    pub fn state(&self) -> PlayerState {
-        self.player_state
+    fn state(&self) -> PlayerState {
+        self.state
     }
 
-    /// Pause the stream.
-    pub fn pause(&mut self) {
-        self.player_state = PlayerState::Paused;
+    fn pause(&mut self) {
+        self.inbox.send(PlayerMessage::SetState(PlayerState::Paused)).unwrap();
     }
 
-    /// Resume the stream from a paused state.
-    pub fn resume(&mut self) {
-        self.player_state = PlayerState::Playing;
+    fn start(&mut self) {
+        self.inbox.send(PlayerMessage::SetState(PlayerState::Playing)).unwrap();
     }
 
-    /// Stop the stream.
-    pub fn stop(&mut self) {
-        self.player_state = PlayerState::Stopped;
+    fn stop(&mut self) {
+        self.inbox.send(PlayerMessage::SetState(PlayerState::Stopped)).unwrap();
     }
 
-    /// Seek to a location in the stream.
-    pub fn seek(&mut self, seek_frac: f32) {
-        // TODO: set target PTS
+    fn seek(&mut self, seek: f32) {
+        self.inbox.send(PlayerMessage::Seek(seek)).unwrap();
     }
 
-    /// Start the stream.
-    pub fn start(&mut self) {
-        self.media_player.start();
-        self.player_state = PlayerState::Playing;
+    fn set_volume(&mut self, volume: u8) {
+        self.inbox.send(PlayerMessage::SetVolume(volume)).unwrap();
     }
 
-    pub fn set_volume(&mut self, volume: u8) {
-        let new_volume = volume.min(self.max_volume());
-        self.options.audio_volume.store(new_volume, Ordering::Relaxed);
+    fn volume(&self) -> u8 {
+        self.volume
     }
 
-    pub fn volume(&self) -> u8 {
-        self.options.audio_volume.load(Ordering::Relaxed)
+    fn volume_f32(&self) -> f32 {
+        self.volume as f32 / u8::MAX as f32
     }
 
-    pub fn volume_f32(&self) -> f32 {
-        self.volume() as f32 / self.max_volume() as f32
+    fn set_volume_f32(&mut self, volume: f32) {
+        self.inbox.send(PlayerMessage::SetVolume((u8::MAX as f32 * volume) as u8)).unwrap();
     }
 
-    pub fn max_volume(&self) -> u8 {
-        self.options.max_audio_volume.load(Ordering::Relaxed)
+    fn looping(&self) -> bool {
+        self.looping
     }
 
-    pub fn set_max_volume(&mut self, volume: u8) {
-        self.options.max_audio_volume.store(volume, Ordering::Relaxed);
+    fn set_looping(&mut self, looping: bool) {
+        self.inbox.send(PlayerMessage::SetLooping(looping)).unwrap();
     }
 
-    pub fn set_volume_f32(&mut self, volume: f32) {
-        let new_volume = (u8::MAX as f32 * volume) as u8;
-        self.set_volume(new_volume);
+    fn debug(&self) -> bool {
+        self.debug
     }
 
-    pub fn ui(&mut self, ui: &mut Ui, size: Vec2) -> Response {
-        self.process_state(size);
-        let frame_response = self.render_frame(ui);
-        self.render_controls(ui, &frame_response);
-        self.render_subtitles(ui, &frame_response);
-        frame_response
+    fn set_debug(&mut self, debug: bool) {
+        self.inbox.send(PlayerMessage::SetDebug(debug)).unwrap();
     }
+}
 
-    pub fn ui_at(&mut self, ui: &mut Ui, rect: Rect) -> Response {
-        self.process_state(rect.size());
-        let frame_response = self.render_frame_at(ui, rect);
-        self.render_controls(ui, &frame_response);
-        self.render_subtitles(ui, &frame_response);
-        frame_response
+pub trait PlayerOverlay {
+    fn show(&self, ui: &mut Ui, state: &mut PlayerOverlayState);
+}
+
+impl<T> CustomPlayer<T>
+where
+    T: PlayerOverlay,
+{
+    fn render_overlay(&mut self, ui: &mut Ui) {
+        let inbox = UiInbox::new();
+        let mut state = PlayerOverlayState {
+            elapsed: self.elapsed(),
+            duration: self.duration(),
+            framerate: self.framerate(),
+            size: self.size(),
+            volume: self.volume(),
+            looping: self.looping,
+            debug: self.debug,
+            state: self.state(),
+            inbox: inbox.sender(),
+        };
+        self.overlay.show(ui, &mut state);
+
+        // drain inbox
+        let r = inbox.read(ui);
+        for m in r {
+            self.process_player_message(m);
+        }
     }
 
     fn process_state(&mut self, size: Vec2) {
         while let Some(msg) = self.media_player.next(size) {
             match msg {
                 DecoderMessage::MediaInfo(i) => {
+                    println!("{}", &i);
                     self.info = Some(i);
                 }
                 DecoderMessage::VideoFrame(pts, duration, f) => {
-                    self.texture_handle.set(f, self.options.texture_options);
-                    self.next_pts = Some(self.next_pts.unwrap_or(pts) + duration);
+                    self.texture_handle.set(f, Default::default());
+                    self.pts_video.store(pts, Ordering::Relaxed);
                 }
                 DecoderMessage::AudioSamples(pts, duration, s) => {
                     if let Some(a) = self.audio.as_mut() {
                         a.tx.push_slice(&s);
                     }
+                    self.pts_audio.store(pts, Ordering::Relaxed);
                 }
-                _ => {}
+                DecoderMessage::Subtitles(pts, duration, text) => {
+                    self.subtitle = Some(Subtitle::from_text(&text))
+                }
             }
+        }
+    }
+
+    fn process_player_message(&mut self, m: PlayerMessage) {
+        match m {
+            PlayerMessage::SetState(s) => {
+                match s {
+                    PlayerState::Stopped => self.stop(),
+                    PlayerState::Paused => self.pause(),
+                    PlayerState::Playing => self.start(),
+                    _ => {}
+                }
+            }
+            PlayerMessage::Seek(v) => {
+                self.seek(v);
+            }
+            PlayerMessage::SetVolume(v) => {
+                self.set_volume(v);
+            }
+            PlayerMessage::SelectStream(_, _) => {}
+            PlayerMessage::SetLooping(l) => self.looping = l,
+            PlayerMessage::SetDebug(d) => self.debug = d,
         }
     }
 
@@ -270,382 +331,61 @@ impl Player {
     }
 
     fn render_subtitles(&mut self, ui: &mut Ui, frame_response: &Response) {
-        // TODO(v0l): reimplement this
+        if let Some(s) = self.subtitle.as_ref() {
+            ui.painter().text(
+                frame_response.rect.min + vec2(frame_response.rect.width() / 2.0, frame_response.rect.height() - 40.),
+                Align2::CENTER_TOP,
+                &s.text,
+                FontId::proportional(13.),
+                Color32::WHITE,
+            );
+        }
     }
 
-    fn render_controls(&mut self, ui: &mut Ui, frame_response: &Response) {
-        let hovered = ui.rect_contains_pointer(frame_response.rect);
-        let currently_seeking = matches!(self.player_state, PlayerState::Seeking(_));
-        let is_stopped = matches!(self.player_state, PlayerState::Stopped);
-        let is_paused = matches!(self.player_state, PlayerState::Paused);
-        let animation_time = 0.2;
-        let seekbar_anim_frac = ui.ctx().animate_bool_with_time(
-            frame_response.id.with("seekbar_anim"),
-            hovered || currently_seeking || is_paused || is_stopped,
-            animation_time,
-        );
+    fn render_debug(&mut self, ui: &mut Ui, frame_response: &Response) {
+        let painter = ui.painter();
 
-        if seekbar_anim_frac <= 0. {
-            return;
+        const PADDING: f32 = 5.0;
+        let vec_padding = vec2(PADDING, PADDING);
+        let job = self.debug_inner();
+        let galley = painter.layout_job(job);
+        let mut bg_pos = galley.rect
+            .translate(frame_response.rect.min.to_vec2() + vec_padding);
+        bg_pos.max += vec_padding * 2.0;
+        painter.rect_filled(bg_pos, PADDING, Color32::from_rgba_unmultiplied(0, 0, 0, 150));
+        painter.galley(bg_pos.min + vec_padding, galley, Color32::PLACEHOLDER);
+    }
+
+    fn debug_inner(&mut self) -> LayoutJob {
+        let v_pts = self.pts_video.load(Ordering::Relaxed);
+        let a_pts = self.pts_audio.load(Ordering::Relaxed);
+        let font = TextFormat::simple(FontId::monospace(11.), Color32::WHITE);
+
+        let mut layout = LayoutJob::default();
+        layout.append(&format!("Sync: v:{}, a:{}, sync:{}", v_pts, a_pts, v_pts - a_pts), 0.0, font.clone());
+
+        let bv = self.info.as_ref().and_then(|i| i.best_video());
+        if let Some(bv) = bv {
+            layout.append(&format!("\n{}", bv), 0.0, font.clone());
         }
 
-        let seekbar_width_offset = 20.;
-        let fullseekbar_width = frame_response.rect.width() - seekbar_width_offset;
-
-        let seekbar_width = fullseekbar_width * self.elapsed();
-
-        let seekbar_offset = 20.;
-        let seekbar_pos =
-            frame_response.rect.left_bottom() + vec2(seekbar_width_offset / 2., -seekbar_offset);
-        let seekbar_height = 3.;
-        let mut fullseekbar_rect =
-            Rect::from_min_size(seekbar_pos, vec2(fullseekbar_width, seekbar_height));
-
-        let mut seekbar_rect =
-            Rect::from_min_size(seekbar_pos, vec2(seekbar_width, seekbar_height));
-        let seekbar_interact_rect = fullseekbar_rect.expand(10.);
-
-        let seekbar_response = ui.interact(
-            seekbar_interact_rect,
-            frame_response.id.with("seekbar"),
-            Sense::click_and_drag(),
-        );
-
-        let seekbar_hovered = seekbar_response.hovered();
-        let seekbar_hover_anim_frac = ui.ctx().animate_bool_with_time(
-            frame_response.id.with("seekbar_hover_anim"),
-            seekbar_hovered || currently_seeking,
-            animation_time,
-        );
-
-        if seekbar_hover_anim_frac > 0. {
-            let new_top = fullseekbar_rect.top() - (3. * seekbar_hover_anim_frac);
-            fullseekbar_rect.set_top(new_top);
-            seekbar_rect.set_top(new_top);
+        let ba = self.info.as_ref().and_then(|i| i.best_audio());
+        if let Some(ba) = ba {
+            layout.append(&format!("\n{}", ba), 0.0, font.clone());
         }
 
-        let seek_indicator_anim = ui.ctx().animate_bool_with_time(
-            frame_response.id.with("seek_indicator_anim"),
-            currently_seeking,
-            animation_time,
-        );
-
-        if currently_seeking {
-            let seek_indicator_shadow = Shadow {
-                offset: vec2(10.0, 20.0),
-                blur: 15.0,
-                spread: 0.0,
-                color: Color32::from_black_alpha(96).linear_multiply(seek_indicator_anim),
-            };
-            let spinner_size = 20. * seek_indicator_anim;
-            ui.painter()
-                .add(seek_indicator_shadow.as_shape(frame_response.rect, Rounding::ZERO));
-            ui.put(
-                Rect::from_center_size(frame_response.rect.center(), Vec2::splat(spinner_size)),
-                Spinner::new().size(spinner_size),
-            );
+        let bs = self.info.as_ref().and_then(|i| i.best_subtitle());
+        if let Some(bs) = bs {
+            layout.append(&format!("\n{}", bs), 0.0, font.clone());
         }
 
-        if seekbar_hovered || currently_seeking {
-            if let Some(hover_pos) = seekbar_response.hover_pos() {
-                if seekbar_response.clicked() || seekbar_response.dragged() {
-                    let seek_frac = ((hover_pos - frame_response.rect.left_top()).x
-                        - seekbar_width_offset / 2.)
-                        .max(0.)
-                        .min(fullseekbar_width)
-                        / fullseekbar_width;
-                    seekbar_rect.set_right(
-                        hover_pos
-                            .x
-                            .min(fullseekbar_rect.right())
-                            .max(fullseekbar_rect.left()),
-                    );
-                    if is_stopped {
-                        self.start()
-                    }
-                    self.seek(seek_frac);
-                }
-            }
-        }
-        let text_color = Color32::WHITE.linear_multiply(seekbar_anim_frac);
-
-        let pause_icon = if is_paused {
-            "▶"
-        } else if is_stopped {
-            "◼"
-        } else if currently_seeking {
-            "↔"
-        } else {
-            "⏸"
-        };
-        let audio_volume_frac = self.volume_f32();
-        let sound_icon = if audio_volume_frac > 0.7 {
-            "🔊"
-        } else if audio_volume_frac > 0.4 {
-            "🔉"
-        } else if audio_volume_frac > 0. {
-            "🔈"
-        } else {
-            "🔇"
-        };
-
-        let mut icon_font_id = FontId::default();
-        icon_font_id.size = 16.;
-
-        let subtitle_icon = "💬";
-        let stream_icon = "🔁";
-        let icon_margin = 5.;
-        let text_y_offset = -7.;
-        let sound_icon_offset = vec2(-5., text_y_offset);
-        let sound_icon_pos = fullseekbar_rect.right_top() + sound_icon_offset;
-
-        let stream_index_icon_offset = vec2(-30., text_y_offset + 1.);
-        let stream_icon_pos = fullseekbar_rect.right_top() + stream_index_icon_offset;
-
-        let contraster_alpha: u8 = 100;
-        let pause_icon_offset = vec2(3., text_y_offset);
-        let pause_icon_pos = fullseekbar_rect.left_top() + pause_icon_offset;
-
-        let duration_text_offset = vec2(25., text_y_offset);
-        let duration_text_pos = fullseekbar_rect.left_top() + duration_text_offset;
-        let mut duration_text_font_id = FontId::default();
-        duration_text_font_id.size = 14.;
-
-        let shadow = Shadow {
-            offset: vec2(10.0, 20.0),
-            blur: 15.0,
-            spread: 0.0,
-            color: Color32::from_black_alpha(25).linear_multiply(seekbar_anim_frac),
-        };
-
-        let mut shadow_rect = frame_response.rect;
-        shadow_rect.set_top(shadow_rect.bottom() - seekbar_offset - 10.);
-
-        let fullseekbar_color = Color32::GRAY.linear_multiply(seekbar_anim_frac);
-        let seekbar_color = Color32::WHITE.linear_multiply(seekbar_anim_frac);
-
-        ui.painter()
-            .add(shadow.as_shape(shadow_rect, Rounding::ZERO));
-
-        ui.painter().rect_filled(
-            fullseekbar_rect,
-            Rounding::ZERO,
-            fullseekbar_color.linear_multiply(0.5),
-        );
-        ui.painter()
-            .rect_filled(seekbar_rect, Rounding::ZERO, seekbar_color);
-        ui.painter().text(
-            pause_icon_pos,
-            Align2::LEFT_BOTTOM,
-            pause_icon,
-            icon_font_id.clone(),
-            text_color,
-        );
-
-        ui.painter().text(
-            duration_text_pos,
-            Align2::LEFT_BOTTOM,
-            format!("{:.0}/{:.0}", self.elapsed(), self.duration()),
-            duration_text_font_id,
-            text_color,
-        );
-
-        if seekbar_hover_anim_frac > 0. {
-            ui.painter().circle_filled(
-                seekbar_rect.right_center(),
-                7. * seekbar_hover_anim_frac,
-                seekbar_color,
-            );
-        }
-
-        if frame_response.clicked() {
-            let mut reset_stream = false;
-            let mut start_stream = false;
-
-            match self.player_state {
-                PlayerState::Stopped => start_stream = true,
-                PlayerState::EndOfFile => reset_stream = true,
-                PlayerState::Paused => self.resume(),
-                PlayerState::Playing => self.pause(),
-                _ => (),
-            }
-
-            if reset_stream {
-                self.resume();
-            } else if start_stream {
-                self.start();
-            }
-        }
-
-        let is_subtitle_cyclable = false;
-        let is_audio_cyclable = false;
-
-        if is_audio_cyclable || is_subtitle_cyclable {
-            let stream_icon_rect = ui.painter().text(
-                stream_icon_pos,
-                Align2::RIGHT_BOTTOM,
-                stream_icon,
-                icon_font_id.clone(),
-                text_color,
-            );
-            let stream_icon_hovered = ui.rect_contains_pointer(stream_icon_rect);
-            let mut stream_info_hovered = false;
-            let mut cursor = stream_icon_rect.right_top() + vec2(0., 5.);
-            let cursor_offset = vec2(3., 15.);
-            let stream_anim_id = frame_response.id.with("stream_anim");
-            let mut stream_anim_frac: f32 = ui
-                .ctx()
-                .memory_mut(|m| *m.data.get_temp_mut_or_default(stream_anim_id));
-
-            let mut draw_row = |stream_type: AVMediaType| {
-                let text = match stream_type {
-                    AVMediaType::AVMEDIA_TYPE_AUDIO => format!(
-                        "{} {}/{}",
-                        sound_icon, 1, 1
-                    ),
-                    AVMediaType::AVMEDIA_TYPE_SUBTITLE => format!(
-                        "{} {}/{}",
-                        subtitle_icon, 1, 1
-                    ),
-                    _ => unreachable!(),
-                };
-
-                let text_position = cursor - cursor_offset;
-                let text_galley =
-                    ui.painter()
-                        .layout_no_wrap(text.clone(), icon_font_id.clone(), text_color);
-
-                let background_rect =
-                    Rect::from_min_max(text_position - text_galley.size(), text_position)
-                        .expand(5.);
-
-                let background_color =
-                    Color32::from_black_alpha(contraster_alpha).linear_multiply(stream_anim_frac);
-
-                ui.painter()
-                    .rect_filled(background_rect, Rounding::same(5.), background_color);
-
-                if ui.rect_contains_pointer(background_rect.expand(5.)) {
-                    stream_info_hovered = true;
-                }
-
-                if ui
-                    .interact(
-                        background_rect,
-                        frame_response.id.with(&text),
-                        Sense::click(),
-                    )
-                    .clicked()
-                {
-                    // TODO: cycle stream
-                };
-
-                let text_rect = ui.painter().text(
-                    text_position,
-                    Align2::RIGHT_BOTTOM,
-                    text,
-                    icon_font_id.clone(),
-                    text_color.linear_multiply(stream_anim_frac),
-                );
-
-                cursor.y = text_rect.top();
-            };
-
-            if stream_anim_frac > 0. {
-                if is_audio_cyclable {
-                    draw_row(AVMediaType::AVMEDIA_TYPE_AUDIO);
-                }
-                if is_subtitle_cyclable {
-                    draw_row(AVMediaType::AVMEDIA_TYPE_SUBTITLE);
-                }
-            }
-
-            stream_anim_frac = ui.ctx().animate_bool_with_time(
-                stream_anim_id,
-                stream_icon_hovered || (stream_info_hovered && stream_anim_frac > 0.),
-                animation_time,
-            );
-
-            ui.ctx()
-                .memory_mut(|m| m.data.insert_temp(stream_anim_id, stream_anim_frac));
-        }
-
-        let sound_icon_rect = ui.painter().text(
-            sound_icon_pos,
-            Align2::RIGHT_BOTTOM,
-            sound_icon,
-            icon_font_id.clone(),
-            text_color,
-        );
-        if ui
-            .interact(
-                sound_icon_rect,
-                frame_response.id.with("sound_icon_sense"),
-                Sense::click(),
-            )
-            .clicked()
-        {
-            if self.volume() != 0 {
-                self.set_volume(0);
-            } else {
-                self.set_volume(50)
-            }
-        }
-
-        let sound_slider_outer_height = 75.;
-
-        let mut sound_slider_rect = sound_icon_rect;
-        sound_slider_rect.set_bottom(sound_icon_rect.top() - icon_margin);
-        sound_slider_rect.set_top(sound_slider_rect.top() - sound_slider_outer_height);
-
-        let sound_slider_interact_rect = sound_slider_rect.expand(icon_margin);
-        let sound_hovered = ui.rect_contains_pointer(sound_icon_rect);
-        let sound_slider_hovered = ui.rect_contains_pointer(sound_slider_interact_rect);
-        let sound_anim_id = frame_response.id.with("sound_anim");
-        let mut sound_anim_frac: f32 = ui
-            .ctx()
-            .memory_mut(|m| *m.data.get_temp_mut_or_default(sound_anim_id));
-        sound_anim_frac = ui.ctx().animate_bool_with_time(
-            sound_anim_id,
-            sound_hovered || (sound_slider_hovered && sound_anim_frac > 0.),
-            0.2,
-        );
-        ui.ctx()
-            .memory_mut(|m| m.data.insert_temp(sound_anim_id, sound_anim_frac));
-        let sound_slider_bg_color =
-            Color32::from_black_alpha(contraster_alpha).linear_multiply(sound_anim_frac);
-        let sound_bar_color =
-            Color32::from_white_alpha(contraster_alpha).linear_multiply(sound_anim_frac);
-        let mut sound_bar_rect = sound_slider_rect;
-        sound_bar_rect
-            .set_top(sound_bar_rect.bottom() - audio_volume_frac * sound_bar_rect.height());
-
-        ui.painter()
-            .rect_filled(sound_slider_rect, Rounding::same(5.), sound_slider_bg_color);
-
-        ui.painter()
-            .rect_filled(sound_bar_rect, Rounding::same(5.), sound_bar_color);
-        let sound_slider_resp = ui.interact(
-            sound_slider_rect,
-            frame_response.id.with("sound_slider_sense"),
-            Sense::click_and_drag(),
-        );
-        if sound_anim_frac > 0. && sound_slider_resp.clicked() || sound_slider_resp.dragged() {
-            if let Some(hover_pos) = ui.ctx().input(|i| i.pointer.hover_pos()) {
-                let sound_frac = 1.
-                    - ((hover_pos - sound_slider_rect.left_top()).y
-                    / sound_slider_rect.height())
-                    .max(0.)
-                    .min(1.);
-                self.set_volume_f32(sound_frac);
-            }
-        }
+        layout
     }
 
     fn open_default_audio_stream(volume: Arc<AtomicU8>) -> Option<PlayerAudioStream> {
         if let Ok(a) = AudioDevice::new() {
             if let Ok(cfg) = a.0.default_output_config() {
-                let audio_sample_buffer = HeapRb::<f32>::new(1024 * 1024);
+                let audio_sample_buffer = HeapRb::<f32>::new(16384);
                 let (tx, mut rx) = audio_sample_buffer.split();
                 if let Ok(stream) = a.0.build_output_stream_raw(
                     &cfg.config(),
@@ -677,26 +417,134 @@ impl Player {
         None
     }
 
-    /// Create a new [`Player`].
-    pub fn new(ctx: &egui::Context, input_path: &String) -> Self {
-        let options = PlayerOptions::default();
+    /// Create a new [`CustomPlayer`].
+    pub fn new(overlay: T, ctx: &egui::Context, input_path: &String) -> Self {
         let texture_handle =
-            ctx.load_texture("vidstream", ColorImage::new([1, 1], Color32::BLACK), options.texture_options);
+            ctx.load_texture("video_frame", ColorImage::new([1, 1], Color32::BLACK), Default::default());
+
+        /// volume arc
+        let vol = Arc::new(AtomicU8::new(255));
 
         /// Open audio device
-        let audio = Self::open_default_audio_stream(options.audio_volume.clone());
-
+        let audio = Self::open_default_audio_stream(vol.clone());
 
         Self {
+            overlay,
             input_path: input_path.clone(),
             texture_handle,
+            looping: false,
+            volume: vol,
             player_state: PlayerState::Stopped,
-            options,
-            next_pts: None,
+            pts_video: Arc::new(AtomicI64::new(0)),
+            pts_audio: Arc::new(AtomicI64::new(0)),
             info: None,
             ctx: ctx.clone(),
             audio,
+            subtitle: None,
             media_player: MediaPlayer::new(input_path, ctx),
+            debug: false,
         }
+    }
+}
+
+impl<T> PlayerControls for CustomPlayer<T>
+where
+    T: PlayerOverlay,
+{
+    /// The elapsed duration of the stream in seconds
+    fn elapsed(&self) -> f32 {
+        // timebase is always 90k
+        self.pts_video.load(Ordering::Relaxed) as f32 * (1.0 / 90_000.0)
+    }
+
+    fn duration(&self) -> f32 {
+        self.info.as_ref().map_or(0.0, |info| info.duration)
+    }
+
+    fn framerate(&self) -> f32 {
+        self.info.as_ref().and_then(|i| i.best_video())
+            .map_or(0.0, |i| i.fps)
+    }
+
+    fn size(&self) -> (u16, u16) {
+        self.info.as_ref().and_then(|i| i.best_video())
+            .map_or((0, 0), |i| (i.width as u16, i.height as u16))
+    }
+
+    fn state(&self) -> PlayerState {
+        self.player_state
+    }
+
+    /// Pause the stream.
+    fn pause(&mut self) {
+        self.player_state = PlayerState::Paused;
+    }
+
+
+    /// Start the stream.
+    fn start(&mut self) {
+        self.media_player.start();
+        self.player_state = PlayerState::Playing;
+    }
+
+    /// Stop the stream.
+    fn stop(&mut self) {
+        self.player_state = PlayerState::Stopped;
+    }
+
+    /// Seek to a location in the stream.
+    fn seek(&mut self, seek_frac: f32) {
+        // TODO: set target PTS
+    }
+
+    fn set_volume(&mut self, volume: u8) {
+        self.volume.store(volume, Ordering::Relaxed);
+    }
+
+    fn volume(&self) -> u8 {
+        self.volume.load(Ordering::Relaxed)
+    }
+
+    fn volume_f32(&self) -> f32 {
+        self.volume() as f32
+    }
+
+    fn set_volume_f32(&mut self, volume: f32) {
+        let new_volume = (u8::MAX as f32 * volume) as u8;
+        self.set_volume(new_volume);
+    }
+
+    fn looping(&self) -> bool {
+        self.looping
+    }
+
+    fn set_looping(&mut self, looping: bool) {
+        self.looping = looping;
+    }
+
+    fn debug(&self) -> bool {
+        self.debug
+    }
+
+    fn set_debug(&mut self, debug: bool) {
+        self.debug = debug;
+    }
+}
+
+impl<T> Widget for &mut CustomPlayer<T>
+where
+    T: PlayerOverlay,
+{
+    fn ui(self, ui: &mut Ui) -> Response {
+        let size = ui.available_size();
+
+        self.process_state(size);
+        let frame_response = self.render_frame(ui);
+        self.render_subtitles(ui, &frame_response);
+        self.render_overlay(ui);
+        if self.debug {
+            self.render_debug(ui, &frame_response);
+        }
+        frame_response
     }
 }

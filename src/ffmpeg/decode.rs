@@ -4,7 +4,8 @@ use std::ptr;
 
 use anyhow::Error;
 use ffmpeg_sys_the_third::AVPictureType::AV_PICTURE_TYPE_NONE;
-use ffmpeg_sys_the_third::{av_frame_alloc, avcodec_alloc_context3, avcodec_find_decoder, avcodec_free_context, avcodec_get_name, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, AVCodec, AVCodecContext, AVFrame, AVPacket, AVStream, AVERROR, AVERROR_EOF};
+use ffmpeg_sys_the_third::{av_buffer_alloc, av_frame_alloc, avcodec_alloc_context3, avcodec_find_decoder, avcodec_free_context, avcodec_get_name, avcodec_open2, avcodec_parameters_to_context, avcodec_receive_frame, avcodec_send_packet, AVCodec, AVCodecContext, AVFrame, AVMediaType, AVPacket, AVStream, AVERROR, AVERROR_EOF};
+use libc::memcpy;
 
 struct CodecContext {
     pub context: *mut AVCodecContext,
@@ -78,7 +79,23 @@ impl Decoder {
             }
             e.insert(CodecContext { context, codec });
         }
+
         if let Some(ctx) = self.codecs.get_mut(&stream_index) {
+
+            // subtitles don't need decoding, create a frame from the pkt data
+            if (*ctx.codec).type_ == AVMediaType::AVMEDIA_TYPE_SUBTITLE {
+                let frame = av_frame_alloc();
+                (*frame).pts = (*pkt).pts;
+                (*frame).pkt_dts = (*pkt).dts;
+                (*frame).duration = (*pkt).duration;
+                (*frame).buf[0] = av_buffer_alloc((*pkt).size as usize);
+                (*frame).data[0] = (*(*frame).buf[0]).data;
+                (*frame).linesize[0] = (*pkt).size;
+                memcpy((*frame).data[0] as *mut libc::c_void,
+                       (*pkt).data as *const libc::c_void, (*pkt).size as usize);
+                return Ok(vec![(frame, stream)]);
+            }
+
             let mut ret = avcodec_send_packet(ctx.context, pkt);
             if ret < 0 {
                 return Err(Error::msg(format!("Failed to decode packet {}", ret)));

@@ -1,3 +1,4 @@
+use std::ffi::CStr;
 use std::ptr;
 use std::time::Instant;
 
@@ -7,9 +8,12 @@ use ffmpeg_sys_the_third::*;
 use crate::ffmpeg::get_ffmpeg_error_msg;
 use crate::return_ffmpeg_error;
 use std::fmt::{Display, Formatter};
+use std::mem::transmute;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DemuxerInfo {
+    pub bitrate: usize,
+    pub duration: f32,
     pub channels: Vec<StreamInfoChannel>,
 }
 
@@ -46,7 +50,7 @@ impl DemuxerInfo {
             AVMediaType::AVMEDIA_TYPE_AUDIO =>
                 (*stream).index == self.best_audio().map_or(usize::MAX, |r| r.index) as libc::c_int,
             AVMediaType::AVMEDIA_TYPE_SUBTITLE =>
-                (*stream).index == self.best_video().map_or(usize::MAX, |r| r.index) as libc::c_int,
+                (*stream).index == self.best_subtitle().map_or(usize::MAX, |r| r.index) as libc::c_int,
             _ => false,
         }
     }
@@ -87,31 +91,31 @@ impl Display for StreamChannelType {
 pub struct StreamInfoChannel {
     pub index: usize,
     pub channel_type: StreamChannelType,
+    pub codec: usize,
     pub width: usize,
     pub height: usize,
     pub fps: f32,
     pub sample_rate: usize,
     pub format: usize,
-    pub bitrate: usize,
-    pub duration: f32,
 }
 
 impl StreamInfoChannel {
     pub fn best_metric(&self) -> f32 {
         match self.channel_type {
-            StreamChannelType::Video => self.bitrate as f32,
-            StreamChannelType::Audio => self.bitrate as f32,
-            StreamChannelType::Subtitle => self.bitrate as f32,
+            StreamChannelType::Video => self.width as f32 * self.height as f32 * self.fps,
+            StreamChannelType::Audio => self.sample_rate as f32,
+            StreamChannelType::Subtitle => 999. - self.index as f32,
         }
     }
 }
 
 impl Display for StreamInfoChannel {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let codec_name = unsafe { CStr::from_ptr(avcodec_get_name(transmute(self.codec as i32))) };
         write!(
             f,
-            "{} #{}: size={}x{},fps={}",
-            self.channel_type, self.index, self.width, self.height, self.fps
+            "{} #{}: codec={},size={}x{},fps={}",
+            self.channel_type, self.index, codec_name.to_str().unwrap(), self.width, self.height, self.fps
         )
     }
 }
@@ -161,32 +165,39 @@ impl Demuxer {
                 AVMediaType::AVMEDIA_TYPE_VIDEO => {
                     channel_infos.push(StreamInfoChannel {
                         index: (*stream).index as usize,
+                        codec: (*(*stream).codecpar).codec_id as usize,
                         channel_type: StreamChannelType::Video,
                         width: (*(*stream).codecpar).width as usize,
                         height: (*(*stream).codecpar).height as usize,
                         fps: av_q2d((*stream).avg_frame_rate) as f32,
                         format: (*(*stream).codecpar).format as usize,
                         sample_rate: 0,
-                        bitrate: (*(*stream).codecpar).bit_rate as usize,
-                        duration: av_q2d((*stream).time_base) as f32 * (*stream).duration as f32,
                     });
                 }
-                AVMediaType::AVMEDIA_TYPE_UNKNOWN => {}
                 AVMediaType::AVMEDIA_TYPE_AUDIO => {
                     channel_infos.push(StreamInfoChannel {
                         index: (*stream).index as usize,
+                        codec: (*(*stream).codecpar).codec_id as usize,
                         channel_type: StreamChannelType::Audio,
                         width: (*(*stream).codecpar).width as usize,
                         height: (*(*stream).codecpar).height as usize,
                         fps: 0.0,
                         format: (*(*stream).codecpar).format as usize,
                         sample_rate: (*(*stream).codecpar).sample_rate as usize,
-                        bitrate: (*(*stream).codecpar).bit_rate as usize,
-                        duration: av_q2d((*stream).time_base) as f32 * (*stream).duration as f32,
                     });
                 }
-                AVMediaType::AVMEDIA_TYPE_DATA => {}
-                AVMediaType::AVMEDIA_TYPE_SUBTITLE => {}
+                AVMediaType::AVMEDIA_TYPE_SUBTITLE => {
+                    channel_infos.push(StreamInfoChannel {
+                        index: (*stream).index as usize,
+                        codec: (*(*stream).codecpar).codec_id as usize,
+                        channel_type: StreamChannelType::Subtitle,
+                        width: 0,
+                        height: 0,
+                        fps: 0.0,
+                        format: 0,
+                        sample_rate: 0,
+                    });
+                }
                 AVMediaType::AVMEDIA_TYPE_ATTACHMENT => {}
                 AVMediaType::AVMEDIA_TYPE_NB => {}
                 _ => {}
@@ -194,7 +205,9 @@ impl Demuxer {
         }
 
         let info = DemuxerInfo {
-            channels: channel_infos
+            duration: (*self.ctx).duration as f32 / AV_TIME_BASE as f32,
+            bitrate: (*self.ctx).bit_rate as usize,
+            channels: channel_infos,
         };
         Ok(info)
     }

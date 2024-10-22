@@ -55,7 +55,7 @@ impl Default for Subtitle {
 }
 
 impl Subtitle {
-    fn from_text(text: &str) -> Self {
+    pub(crate) fn from_text(text: &str) -> Self {
         Subtitle::default().with_text(text)
     }
     pub(crate) fn with_text(mut self, text: &str) -> Self {

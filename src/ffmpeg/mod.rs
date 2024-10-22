@@ -224,6 +224,14 @@ impl MediaPlayer {
                     }
                     Err(e) => panic!("{}", e)
                 }
+            } else if (*(*stream).codecpar).codec_type == AVMediaType::AVMEDIA_TYPE_SUBTITLE {
+                let pts = av_rescale_q((*frame).pts, (*stream).time_base, tbn);
+                let duration = av_rescale_q((*frame).duration, (*stream).time_base, tbn);
+                let str: &[u8] = slice::from_raw_parts((*frame).data[0], (*frame).linesize[0] as usize);
+                let str = String::from_utf8_lossy(str).to_string();
+                if let Ok(mut q) = tx.lock() {
+                    q.push(DecoderMessage::Subtitles(pts, duration, str));
+                }
             }
         }
     }
