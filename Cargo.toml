@@ -3,7 +3,7 @@ name = "egui-video"
 version = "0.8.0"
 edition = "2021"
 license = "MIT"
-description = "a video library for egui"
+description = "a video player for egui"
 repository = "https://github.com/n00kii/egui-video"
 readme = "README.md"
 authors = ["n00kii"]
@@ -14,18 +14,15 @@ authors = ["n00kii"]
 default = []
 
 [dependencies]
-egui = "0.29"
-bytemuck = "^1.7"
-anyhow = "1.0.86"
-chrono = "0.4.38"
+egui = "^0.29"
+anyhow = "^1.0.86"
 cpal = { version = "0.15.3", features = ["oboe-shared-stdcxx"] }
-ffmpeg-sys-the-third = { git = "https://github.com/shssoichiro/ffmpeg-the-third.git", branch = "master", package = "ffmpeg-sys-the-third" }
-libc = { version = "0.2.160" }
+ffmpeg-rs-raw = { git = "https://git.v0l.io/Kieran/ffmpeg-rs-raw.git", rev = "3e74159ade82df107addf36cb5550500461122f4" }
 nom = "7.1.3"
 ringbuf = "0.4.7"
 atomic = "0.6.0"
 log = "0.4.22"
-egui_inbox = "0.6.0"
+egui_inbox = "^0.6.0"
 
 [dev-dependencies]
 rfd = "0.15.0"

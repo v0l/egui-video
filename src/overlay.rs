@@ -2,7 +2,7 @@ use crate::{PlayerControls, PlayerOverlay, PlayerOverlayState, PlayerState};
 use egui::{
     vec2, Align2, Color32, FontId, Rect, Response, Rounding, Sense, Shadow, Spinner, Ui, Vec2,
 };
-use ffmpeg_sys_the_third::AVMediaType;
+use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
 
 pub struct DefaultOverlay {}
 

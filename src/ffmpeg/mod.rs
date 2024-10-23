@@ -1,47 +1,17 @@
-use crate::ffmpeg::decode::Decoder;
-use crate::ffmpeg::demux::Demuxer;
+use crate::ffmpeg_sys_the_third::{
+    av_frame_free, av_packet_free, av_q2d, av_rescale_q, av_sample_fmt_is_planar, AVFrame,
+    AVMediaType, AVPixelFormat, AVRational, AVSampleFormat, AVStream,
+};
 use crate::DecoderMessage;
 use egui::{Color32, ColorImage, Vec2};
-use ffmpeg_sys_the_third::{
-    av_frame_free, av_make_error_string, av_packet_free, av_q2d, av_rescale_q,
-    av_sample_fmt_is_planar, AVFrame, AVMediaType, AVPixelFormat, AVRational, AVSampleFormat,
-    AVStream,
-};
+use ffmpeg_rs_raw::{Decoder, Demuxer, DemuxerInfo, Resample, Scaler};
 use std::collections::BinaryHeap;
-use std::ffi::CStr;
 use std::mem::transmute;
 use std::slice;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-
-pub mod decode;
-pub mod demux;
-pub mod resample;
-pub mod scale;
-
-use crate::ffmpeg::resample::Resample;
-use crate::ffmpeg::scale::Scaler;
-pub use demux::DemuxerInfo;
-
-#[macro_export]
-macro_rules! return_ffmpeg_error {
-    ($x:expr) => {
-        if $x < 0 {
-            return Err(Error::msg(get_ffmpeg_error_msg($x)));
-        }
-    };
-}
-
-pub fn get_ffmpeg_error_msg(ret: libc::c_int) -> String {
-    unsafe {
-        const BUF_SIZE: usize = 512;
-        let mut buf: [libc::c_char; BUF_SIZE] = [0; BUF_SIZE];
-        av_make_error_string(buf.as_mut_ptr(), BUF_SIZE, ret);
-        String::from(CStr::from_ptr(buf.as_ptr()).to_str().unwrap())
-    }
-}
 
 pub unsafe fn video_frame_to_image(frame: *const AVFrame) -> ColorImage {
     let size = [(*frame).width as usize, (*frame).height as usize];
@@ -209,15 +179,14 @@ impl MediaPlayer {
 
                     // read frames
                     let (mut pkt, stream) = demux.get_packet().expect("failed to get packet");
-                    if !probed.as_ref().unwrap().is_best_stream(stream) {
+                    if pkt.is_null() || !probed.as_ref().unwrap().is_best_stream(stream) {
                         av_packet_free(&mut pkt);
                         continue;
                     }
 
-                    if let Ok(mut frames) = decode.decode_pkt(pkt, stream) {
+                    if let Ok(frames) = decode.decode_pkt(pkt, stream) {
                         let width = width.load(Ordering::Relaxed);
                         let height = height.load(Ordering::Relaxed);
-                        frames.sort_by(|a, b| (*a.0).pts.cmp(&(*b.0).pts));
                         for (mut frame, stream) in frames {
                             Self::process_frame(
                                 &tx,
@@ -258,8 +227,13 @@ impl MediaPlayer {
                     }
 
                     ctx.request_repaint();
+                    if pkt.is_null() {
+                        break;
+                    }
                     av_packet_free(&mut pkt);
                 }
+
+                eprintln!("exit player loop")
             }
         }));
     }

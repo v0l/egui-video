@@ -7,11 +7,12 @@ use egui::{
     TextureHandle, Ui, Vec2, Widget,
 };
 
-use crate::ffmpeg::{DemuxerInfo, MediaPlayer};
+use crate::ffmpeg::MediaPlayer;
 use crate::subtitle::Subtitle;
 use egui::text::LayoutJob;
 use egui_inbox::{UiInbox, UiInboxSender};
-use ffmpeg_sys_the_third::AVMediaType;
+use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
+use ffmpeg_rs_raw::DemuxerInfo;
 use ringbuf::consumer::Consumer;
 use ringbuf::producer::Producer;
 use ringbuf::storage::Heap;
