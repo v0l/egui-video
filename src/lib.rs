@@ -15,6 +15,7 @@ mod subtitle;
 use crate::overlay::DefaultOverlay;
 pub use audio::*;
 use egui::{Response, Ui, Widget};
+pub use ffmpeg_rs_raw;
 pub use ffmpeg_rs_raw::ffmpeg_sys_the_third;
 pub use player::*;
 
