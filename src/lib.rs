@@ -7,7 +7,7 @@
 //! ```
 
 mod audio;
-pub mod ffmpeg;
+pub mod media_player;
 mod overlay;
 mod player;
 mod subtitle;

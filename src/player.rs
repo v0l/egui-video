@@ -1,25 +1,22 @@
+use crate::media_player::{DecoderMessage, MediaPlayer};
+use crate::subtitle::Subtitle;
 use crate::AudioDevice;
 use cpal::traits::DeviceTrait;
-use cpal::{Stream, SupportedStreamConfig};
+use cpal::{SampleFormat, Stream, SupportedStreamConfig};
 use egui::load::SizedTexture;
+use egui::text::LayoutJob;
 use egui::{
     vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Sense, TextFormat,
-    TextureHandle, Ui, Vec2, Widget,
+    TextureHandle, TextureOptions, Ui, Vec2, Widget,
 };
-
-use crate::ffmpeg::MediaPlayer;
-use crate::subtitle::Subtitle;
-use egui::text::LayoutJob;
 use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
 use ffmpeg_rs_raw::DemuxerInfo;
-use ringbuf::consumer::Consumer;
-use ringbuf::producer::Producer;
-use ringbuf::storage::Heap;
-use ringbuf::traits::Split;
-use ringbuf::{CachingProd, HeapRb, SharedRb};
-use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 /// IPC for player
@@ -38,74 +35,37 @@ enum PlayerMessage {
     SelectStream(AVMediaType, usize),
 }
 
-#[derive(Debug)]
-/// Messages received from the decoder
-pub enum DecoderMessage {
-    MediaInfo(DemuxerInfo),
-    /// Video frame from the decoder
-    VideoFrame(i64, i64, ColorImage),
-    /// Audio samples from the decoder
-    AudioSamples(i64, i64, Vec<f32>),
-    Subtitles(i64, i64, String),
-}
-
-impl DecoderMessage {
-    pub fn pts(&self) -> i64 {
-        match self {
-            DecoderMessage::AudioSamples(pts, _, _) => *pts,
-            DecoderMessage::VideoFrame(pts, _, _) => *pts,
-            _ => 0,
-        }
-    }
-}
-
-impl PartialEq<Self> for DecoderMessage {
-    fn eq(&self, other: &Self) -> bool {
-        other.cmp(self).is_eq()
-    }
-}
-
-impl Eq for DecoderMessage {}
-
-impl Ord for DecoderMessage {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        let pts_a = match self {
-            DecoderMessage::AudioSamples(pts, _, _) => *pts,
-            DecoderMessage::VideoFrame(pts, _, _) => *pts,
-            _ => 0,
-        };
-        let pts_b = match other {
-            DecoderMessage::AudioSamples(pts, _, _) => *pts,
-            DecoderMessage::VideoFrame(pts, _, _) => *pts,
-            _ => 0,
-        };
-        pts_b.cmp(&pts_a)
-    }
-}
-
-impl PartialOrd for DecoderMessage {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
 /// The [`CustomPlayer`] processes and controls streams of video/audio.
 /// This is what you use to show a video file.
 /// Initialize once, and use the [`CustomPlayer::ui`] or [`CustomPlayer::ui_at()`] functions to show the playback.
-pub struct CustomPlayer<T>
-where
-    T: PlayerOverlay,
-{
+pub struct CustomPlayer<T> {
+    exiting: Arc<AtomicBool>,
     overlay: T,
     player_state: PlayerState,
-    texture_handle: TextureHandle,
     looping: bool,
     volume: Arc<AtomicU8>,
     debug: bool,
 
-    /// Next PTS
-    pts_video: Arc<AtomicI64>,
-    pts_audio: Arc<AtomicI64>,
+    avg_fps: f32,
+    avg_fps_start: Instant,
+    last_frame_counter: u64,
+    pts_audio: i64,
+
+    /// The video frame to display
+    frame: TextureHandle,
+    /// Video frame PTS
+    frame_pts: i64,
+    /// Duration to show [frame]
+    frame_duration: i64,
+    /// Realtime of when [frame] was shown
+    frame_start: Instant,
+    /// When playback was started
+    play_start: Instant,
+    /// How many frames have been rendered so far
+    frame_counter: u64,
+
+    frame_timer: Option<JoinHandle<()>>,
+
     /// Stream info
     info: Option<DemuxerInfo>,
 
@@ -122,7 +82,53 @@ struct PlayerAudioStream {
     pub device: AudioDevice,
     pub config: SupportedStreamConfig,
     pub stream: Stream,
-    pub tx: CachingProd<Arc<SharedRb<Heap<f32>>>>,
+    pub buffer: Arc<Mutex<AudioBuffer>>,
+}
+
+struct AudioBuffer {
+    channels: u8,
+    sample_rate: u32,
+    // buffered samples
+    samples: VecDeque<f32>,
+    /// Video position in seconds
+    video_pos: f32,
+    /// Audio position in seconds
+    audio_pos: f32,
+}
+
+impl AudioBuffer {
+    pub fn new(sample_rate: u32, channels: u8) -> Self {
+        Self {
+            channels,
+            sample_rate,
+            samples: VecDeque::new(),
+            video_pos: 0.0,
+            audio_pos: 0.0,
+        }
+    }
+
+    pub fn add_samples(&mut self, samples: Vec<f32>, duration: i64) {
+        self.samples.extend(samples);
+    }
+
+    pub fn take_samples(&mut self, n: usize) -> Vec<f32> {
+        assert_eq!(0, n % self.channels as usize, "Must be a multiple of 2");
+        self.audio_pos += (n as f32 / self.sample_rate as f32 / self.channels as f32);
+        self.samples.drain(..n).collect()
+    }
+
+    pub fn set_video_pos(&mut self, pos: f32) {
+        self.video_pos = pos;
+    }
+
+    pub fn audio_delay_secs(&self) -> f32 {
+        self.audio_pos - self.video_pos
+    }
+
+    pub fn audio_delay_samples(&self) -> isize {
+        let samples_f32 = self.sample_rate as f32 * (self.audio_pos - self.video_pos);
+        samples_f32 as isize * self.channels as isize
+    }
 }
 
 /// The possible states of a [`CustomPlayer`].
@@ -258,48 +264,104 @@ pub trait PlayerOverlay {
     fn show(&self, ui: &mut Ui, frame: &Response, state: &mut PlayerOverlayState);
 }
 
-impl<T> CustomPlayer<T>
-where
-    T: PlayerOverlay,
-{
-    fn render_overlay(&mut self, ui: &mut Ui, frame: &Response) {
-        let inbox = UiInbox::new();
-        let mut state = PlayerOverlayState {
-            elapsed: self.elapsed(),
-            duration: self.duration(),
-            framerate: self.framerate(),
-            size: self.size(),
-            volume: self.volume(),
-            looping: self.looping,
-            debug: self.debug,
-            state: self.state(),
-            inbox: inbox.sender(),
-        };
-        self.overlay.show(ui, frame, &mut state);
-
-        // drain inbox
-        let r = inbox.read(ui);
-        for m in r {
-            self.process_player_message(m);
+impl<T> Drop for CustomPlayer<T> {
+    fn drop(&mut self) {
+        self.exiting.store(true, Ordering::Relaxed);
+        if let Some(j) = self.frame_timer.take() {
+            j.join().unwrap();
         }
+    }
+}
+
+impl<T> CustomPlayer<T> {
+    /// Store the next image
+    fn load_frame(&mut self, image: ColorImage, pts: i64, duration: i64) {
+        self.frame.set(image, TextureOptions::default());
+        self.frame_pts = pts;
+        self.frame_duration = duration;
+        self.frame_counter += 1;
+
+        let now = Instant::now();
+        let frame_end = self.frame_start + self.pts_to_duration(self.frame_duration);
+        let frame_delay = if now > frame_end {
+            now - frame_end
+        } else {
+            Duration::ZERO
+        };
+        self.frame_start = Instant::now() - frame_delay;
+    }
+
+    /// Check if the current frame should be flipped
+    fn check_load_frame(&mut self) -> bool {
+        if self.player_state != PlayerState::Playing {
+            // force frame to start now, while paused
+            self.frame_start = Instant::now();
+            return false;
+        }
+        let now = Instant::now();
+        now >= (self.frame_start + self.pts_to_duration(self.frame_duration))
+    }
+
+    fn next_frame_max_pts(&self) -> i64 {
+        self.frame_pts + self.frame_duration + self.frame_duration
     }
 
     fn process_state(&mut self, size: Vec2) {
-        while let Some(msg) = self.media_player.next(size) {
+        self.media_player.set_target_size(size);
+
+        // check if we should load the next video frame
+        if !self.check_load_frame() {
+            return;
+        }
+
+        // reset avg fps timer every 0.5s
+        if self.frame_counter != 0
+            && self.frame_counter % (self.framerate() / 2.0).max(1.0) as u64 == 0
+        {
+            let n_frames = self.frame_counter - self.last_frame_counter;
+            self.avg_fps = n_frames as f32 / (Instant::now() - self.avg_fps_start).as_secs_f32();
+            self.avg_fps_start = Instant::now();
+            self.last_frame_counter = self.frame_counter;
+        }
+
+        while let Some(msg) = self.media_player.next() {
             match msg {
                 DecoderMessage::MediaInfo(i) => {
-                    println!("{}", &i);
                     self.info = Some(i);
+                    let fps = self.framerate();
+                    if fps > 0.0 {
+                        let cx = self.ctx.clone();
+                        let closing = self.exiting.clone();
+                        self.frame_timer = Some(std::thread::spawn(move || loop {
+                            if closing.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            cx.request_repaint();
+                            std::thread::sleep(Duration::from_secs_f32(0.5 / fps));
+                        }));
+                    }
                 }
                 DecoderMessage::VideoFrame(pts, duration, f) => {
-                    self.texture_handle.set(f, Default::default());
-                    self.pts_video.store(pts, Ordering::Relaxed);
+                    if self.frame_counter == 0 {
+                        self.play_start = Instant::now();
+                    }
+
+                    self.load_frame(f, pts, duration);
+
+                    // break on video frame
+                    // once we load the next frame this loop will not call again until
+                    // this frame is over (pts + duration)
+                    break;
                 }
                 DecoderMessage::AudioSamples(pts, duration, s) => {
+                    let v_pts = self.pts_to_sec(self.frame_pts);
                     if let Some(a) = self.audio.as_mut() {
-                        a.tx.push_slice(&s);
+                        if let Ok(mut q) = a.buffer.lock() {
+                            q.add_samples(s, pts);
+                            q.set_video_pos(v_pts as f32);
+                        }
                     }
-                    self.pts_audio.store(pts, Ordering::Relaxed);
+                    self.pts_audio = pts;
                 }
                 DecoderMessage::Subtitles(pts, duration, text) => {
                     self.subtitle = Some(Subtitle::from_text(&text))
@@ -329,11 +391,11 @@ where
     }
 
     fn generate_frame_image(&self) -> Image {
-        Image::new(SizedTexture::from_handle(&self.texture_handle)).sense(Sense::click())
+        Image::new(SizedTexture::from_handle(&self.frame)).sense(Sense::click())
     }
 
     fn render_frame(&self, ui: &mut Ui) -> Response {
-        ui.add(self.generate_frame_image())
+        self.render_frame_at(ui, ui.available_rect_before_wrap())
     }
 
     fn render_frame_at(&self, ui: &mut Ui, rect: Rect) -> Response {
@@ -367,21 +429,25 @@ where
             .rect
             .translate(frame_response.rect.min.to_vec2() + vec_padding);
         bg_pos.max += vec_padding * 2.0;
-        painter.rect_filled(
-            bg_pos,
-            PADDING,
-            Color32::from_rgba_unmultiplied(0, 0, 0, 150),
-        );
+        painter.rect_filled(bg_pos, PADDING, Color32::from_black_alpha(150));
         painter.galley(bg_pos.min + vec_padding, galley, Color32::PLACEHOLDER);
     }
 
-    fn pts_to_sec(&self, pts: i64) -> f32 {
-        pts as f32 * (self.media_player.tbn.num as f32 / self.media_player.tbn.den as f32)
+    fn pts_to_sec(&self, pts: i64) -> f64 {
+        (pts as f64 / self.media_player.tbn.den as f64) * self.media_player.tbn.num as f64
+    }
+
+    fn pts_to_duration(&self, pts: i64) -> Duration {
+        Duration::from_secs_f64(self.pts_to_sec(pts))
     }
 
     fn debug_inner(&mut self) -> LayoutJob {
-        let v_pts = self.pts_to_sec(self.pts_video.load(Ordering::Relaxed));
-        let a_pts = self.pts_to_sec(self.pts_audio.load(Ordering::Relaxed));
+        let v_pts = self.elapsed();
+        let a_pts = if let Some(a) = self.audio.as_ref() {
+            a.buffer.lock().map_or(0.0, |a| a.audio_pos)
+        } else {
+            0.0
+        };
         let font = TextFormat::simple(FontId::monospace(11.), Color32::WHITE);
 
         let mut layout = LayoutJob::default();
@@ -390,15 +456,24 @@ where
                 "sync: v:{:.3}s, a:{:.3}s, a-sync:{:.3}s",
                 v_pts,
                 a_pts,
-                v_pts - a_pts
+                a_pts - v_pts
             ),
             0.0,
             font.clone(),
         );
 
-        let max_pts = self.pts_to_sec(self.media_player.pts_max());
-        let buf_len = if max_pts != 0.0 { max_pts - v_pts } else { 0.0 };
-        layout.append(&format!("\nbuffer: {:.3}s", buf_len), 0.0, font.clone());
+        layout.append(
+            &format!(
+                "\nplayback: {:.2} fps ({:.2}x)",
+                self.avg_fps,
+                self.avg_fps / self.framerate()
+            ),
+            0.0,
+            font.clone(),
+        );
+
+        let buffer = self.pts_to_sec(self.media_player.buffer_size());
+        layout.append(&format!("\nbuffer: {:.3}s", buffer), 0.0, font.clone());
 
         let bv = self.info.as_ref().and_then(|i| i.best_video());
         if let Some(bv) = bv {
@@ -418,23 +493,49 @@ where
         layout
     }
 
-    fn open_default_audio_stream(volume: Arc<AtomicU8>) -> Option<PlayerAudioStream> {
+    fn open_default_audio_stream(
+        volume: Arc<AtomicU8>,
+        exit: Arc<AtomicBool>,
+    ) -> Option<PlayerAudioStream> {
         if let Ok(a) = AudioDevice::new() {
             if let Ok(cfg) = a.0.default_output_config() {
-                let audio_sample_buffer = HeapRb::<f32>::new(16384);
-                let (tx, mut rx) = audio_sample_buffer.split();
+                let buffer = Arc::new(Mutex::new(AudioBuffer::new(
+                    cfg.sample_rate().0,
+                    cfg.channels() as u8,
+                )));
+                let b_clone = buffer.clone();
                 if let Ok(stream) = a.0.build_output_stream_raw(
                     &cfg.config(),
-                    cfg.sample_format(),
+                    SampleFormat::F32,
                     move |data: &mut cpal::Data, info: &cpal::OutputCallbackInfo| {
-                        let dst: &mut [f32] = data.as_slice_mut().unwrap();
+                        let mut dst: &mut [f32] = data.as_slice_mut().unwrap();
                         dst.fill(0.0);
-                        rx.pop_slice(dst);
+                        loop {
+                            if exit.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            if let Ok(mut buf) = b_clone.lock() {
+                                let delay = buf.audio_delay_samples();
 
-                        // mul volume
-                        let v = volume.load(Ordering::Relaxed) as f32 / u8::MAX as f32;
-                        for s in dst {
-                            *s *= v;
+                                // data didnt start yet just leave silence
+                                if buf.video_pos == 0.0 {
+                                    break;
+                                }
+                                // not enough samples, block thread
+                                if buf.samples.len() < dst.len() {
+                                    drop(buf);
+                                    std::thread::sleep(Duration::from_millis(5));
+                                    continue;
+                                }
+                                let v = volume.load(Ordering::Relaxed) as f32 / u8::MAX as f32;
+                                let w_len = dst.len().min(buf.samples.len());
+                                let mut i = 0;
+                                for s in buf.take_samples(w_len) {
+                                    dst[i] = s * v;
+                                    i += 1;
+                                }
+                                break;
+                            }
                         }
                     },
                     move |e| {
@@ -446,7 +547,7 @@ where
                         device: a,
                         config: cfg,
                         stream,
-                        tx,
+                        buffer,
                     });
                 }
             }
@@ -457,45 +558,60 @@ where
 
     /// Create a new [`CustomPlayer`].
     pub fn new(overlay: T, ctx: &egui::Context, input_path: &String) -> Self {
-        let texture_handle = ctx.load_texture(
-            "video_frame",
-            ColorImage::new([1, 1], Color32::BLACK),
-            Default::default(),
-        );
-
         /// volume arc
-        let vol = Arc::new(AtomicU8::new(255));
+        let vol = Arc::new(AtomicU8::new(200));
+
+        /// exit signal (on drop)
+        let exit = Arc::new(AtomicBool::new(false));
 
         /// Open audio device
-        let audio = Self::open_default_audio_stream(vol.clone());
+        let audio = Self::open_default_audio_stream(vol.clone(), exit.clone());
 
+        let mut media_player = MediaPlayer::new(input_path);
+        if let Some(a) = &audio {
+            media_player.set_target_sample_rate(a.config.sample_rate().0);
+        }
+
+        let init_size = ctx.available_rect();
         Self {
+            exiting: exit,
             overlay,
             input_path: input_path.clone(),
-            texture_handle,
             looping: false,
             volume: vol,
             player_state: PlayerState::Stopped,
-            pts_video: Arc::new(AtomicI64::new(0)),
-            pts_audio: Arc::new(AtomicI64::new(0)),
+            pts_audio: 0,
+            frame: ctx.load_texture(
+                "video_frame",
+                ColorImage::new(
+                    [init_size.width() as usize, init_size.height() as usize],
+                    Color32::BLACK,
+                ),
+                Default::default(),
+            ),
+            frame_start: Instant::now(),
+            frame_pts: 0,
+            frame_duration: 0,
+            frame_timer: None,
             info: None,
             ctx: ctx.clone(),
             audio,
             subtitle: None,
-            media_player: MediaPlayer::new(input_path, ctx),
+            media_player,
             debug: false,
+            avg_fps: 0.0,
+            avg_fps_start: Instant::now(),
+            frame_counter: 0,
+            last_frame_counter: 0,
+            play_start: Instant::now(),
         }
     }
 }
 
-impl<T> PlayerControls for CustomPlayer<T>
-where
-    T: PlayerOverlay,
-{
+impl<T> PlayerControls for CustomPlayer<T> {
     /// The elapsed duration of the stream in seconds
     fn elapsed(&self) -> f32 {
-        // timebase is always 90k
-        self.pts_video.load(Ordering::Relaxed) as f32 * (1.0 / 90_000.0)
+        self.frame_counter as f32 / self.framerate()
     }
 
     fn duration(&self) -> f32 {
@@ -523,14 +639,13 @@ where
     /// Pause the stream.
     fn pause(&mut self) {
         self.player_state = PlayerState::Paused;
-        self.media_player.set_paused(true);
     }
 
     /// Start the stream.
     fn start(&mut self) {
         self.media_player.start();
         self.player_state = PlayerState::Playing;
-        self.media_player.set_paused(false);
+        self.play_start = Instant::now();
     }
 
     /// Stop the stream.
@@ -592,5 +707,32 @@ where
             self.render_debug(ui, &frame_response);
         }
         frame_response
+    }
+}
+
+impl<T> CustomPlayer<T>
+where
+    T: PlayerOverlay,
+{
+    fn render_overlay(&mut self, ui: &mut Ui, frame: &Response) {
+        let inbox = UiInbox::new();
+        let mut state = PlayerOverlayState {
+            elapsed: self.elapsed(),
+            duration: self.duration(),
+            framerate: self.framerate(),
+            size: self.size(),
+            volume: self.volume(),
+            looping: self.looping,
+            debug: self.debug,
+            state: self.state(),
+            inbox: inbox.sender(),
+        };
+        self.overlay.show(ui, frame, &mut state);
+
+        // drain inbox
+        let r = inbox.read(ui);
+        for m in r {
+            self.process_player_message(m);
+        }
     }
 }

@@ -1,10 +1,10 @@
-use eframe::NativeOptions;
+use eframe::{NativeOptions, Renderer};
 use egui::{vec2, CentralPanel, TextEdit, Widget};
 use egui_video::{AudioDevice, Player, PlayerControls};
 
 fn main() {
     let mut opt = NativeOptions::default();
-    opt.viewport.inner_size = Some(vec2(640., 480.));
+    opt.viewport.inner_size = Some(vec2(1280., 740.));
 
     let _ = eframe::run_native("app", opt, Box::new(|_| Ok(Box::new(App::default()))));
 }
