@@ -390,8 +390,8 @@ impl<T> CustomPlayer<T> {
         }
     }
 
-    fn generate_frame_image(&self) -> Image {
-        Image::new(SizedTexture::from_handle(&self.frame)).sense(Sense::click())
+    fn generate_frame_image(&self, size: Vec2) -> Image {
+        Image::new(SizedTexture::new(self.frame.id(), size)).sense(Sense::click())
     }
 
     fn render_frame(&self, ui: &mut Ui) -> Response {
@@ -399,7 +399,7 @@ impl<T> CustomPlayer<T> {
     }
 
     fn render_frame_at(&self, ui: &mut Ui, rect: Rect) -> Response {
-        ui.put(rect, self.generate_frame_image())
+        ui.put(rect, self.generate_frame_image(rect.size()))
     }
 
     fn render_subtitles(&mut self, ui: &mut Ui, frame_response: &Response) {
