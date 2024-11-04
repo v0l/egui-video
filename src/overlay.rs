@@ -6,6 +6,28 @@ use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
 
 pub struct DefaultOverlay {}
 
+impl DefaultOverlay {
+    fn format_time(secs: f32) -> String {
+        const MIN: f32 = 60.0;
+        const HR: f32 = MIN * 60.0;
+
+        if secs >= HR {
+            format!(
+                "{:0>2.0}:{:0>2.0}:{:0>2.0}",
+                (secs / HR).floor(),
+                ((secs % HR) / MIN).floor(),
+                (secs % MIN).floor()
+            )
+        } else {
+            format!(
+                "{:0>2.0}:{:0>2.0}",
+                (secs / MIN).floor(),
+                (secs % MIN).floor()
+            )
+        }
+    }
+}
+
 impl PlayerOverlay for DefaultOverlay {
     fn show(&self, ui: &mut Ui, frame_response: &Response, p: &mut PlayerOverlayState) {
         let hovered = ui.rect_contains_pointer(frame_response.rect);
@@ -184,7 +206,15 @@ impl PlayerOverlay for DefaultOverlay {
         ui.painter().text(
             duration_text_pos,
             Align2::LEFT_BOTTOM,
-            format!("{:.0}/{:.0}", p.elapsed(), p.duration()),
+            if p.duration() > 0.0 {
+                format!(
+                    "{} / {}",
+                    Self::format_time(p.elapsed()),
+                    Self::format_time(p.duration())
+                )
+            } else {
+                Self::format_time(p.elapsed())
+            },
             duration_text_font_id,
             text_color,
         );
