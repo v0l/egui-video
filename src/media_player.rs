@@ -147,7 +147,7 @@ pub struct MediaPlayer {
 
     /// Audio channel to bypass [media_queue]
     /// Audio needs more buffering than video frames
-    audio_chan: Option<std::sync::mpsc::Sender<DecoderMessage>>,
+    audio_chan: Option<Sender<DecoderMessage>>,
 
     pub tbn: AVRational,
 }

@@ -12,6 +12,7 @@ use egui::{
 use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
 use ffmpeg_rs_raw::DemuxerInfo;
+use log::trace;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::Receiver;
@@ -564,7 +565,7 @@ impl<T> CustomPlayer<T> {
                                 }
                                 // do nothing, leave silence in dst
                                 if buf.paused {
-                                    return;
+                                    break;
                                 }
                                 // data didn't start yet just leave silence
                                 if buf.video_pos == 0.0 {
@@ -574,13 +575,15 @@ impl<T> CustomPlayer<T> {
                                 if buf.samples.len() < dst.len() {
                                     drop(buf);
                                     std::thread::sleep(Duration::from_millis(5));
+                                    trace!("Audio: buffer under-run!");
                                     continue;
                                 }
                                 // lazy audio sync
                                 let sync = buf.audio_delay_secs();
-                                if sync > 0.01 {
+                                if sync > 0.05 {
                                     let drop_samples = buf.audio_delay_samples() as usize;
                                     buf.take_samples(drop_samples);
+                                    trace!("Audio: dropping {drop_samples} audio samples");
                                 }
                                 let v = volume.load(Ordering::Relaxed) as f32 / u8::MAX as f32;
                                 let w_len = dst.len().min(buf.samples.len());
