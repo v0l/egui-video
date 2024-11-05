@@ -2,6 +2,11 @@ use crate::ffmpeg_sys_the_third::{
     av_frame_free, av_frame_unref, av_packet_free, av_rescale_q, av_sample_fmt_is_planar, AVFrame,
     AVMediaType, AVPixelFormat, AVRational, AVSampleFormat, AVStream,
 };
+#[cfg(feature = "hls")]
+use crate::hls::DemuxerIsh;
+#[cfg(feature = "hls")]
+use crate::hls::HlsStream;
+
 use egui::{Color32, ColorImage, Vec2};
 use ffmpeg_rs_raw::{Decoder, Demuxer, DemuxerInfo, Resample, Scaler};
 use std::collections::BinaryHeap;
@@ -75,6 +80,8 @@ unsafe fn map_frame_to_pixels(frame: *mut AVFrame) -> Vec<Color32> {
 /// Messages received from the decoder
 pub enum DecoderMessage {
     MediaInfo(DemuxerInfo),
+    /// A fatal error occurred during media playback
+    Error(String),
     /// Video frame from the decoder
     VideoFrame(i64, i64, ColorImage),
     /// Audio samples from the decoder
@@ -138,7 +145,7 @@ impl Drop for MediaPlayer {
     fn drop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
+            thread.join().expect("join failed");
         }
     }
 }
@@ -226,14 +233,31 @@ impl MediaPlayer {
     pub fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
-            thread.join().unwrap();
+            thread.join().expect("join failed");
         }
-        self.thread = None;
+    }
+
+    #[cfg(feature = "hls")]
+    fn open_demuxer(input: &str) -> Box<dyn DemuxerIsh> {
+        if input.contains(".m3u8") {
+            Box::new(HlsStream::new(input))
+        } else {
+            Box::new(Demuxer::new(input))
+        }
+    }
+
+    #[cfg(not(feature = "hls"))]
+    fn open_demuxer(input: &str) -> Demuxer {
+        Demuxer::new(input)
     }
 
     pub fn start(&mut self) {
-        if self.thread.is_some() {
-            return;
+        if let Some(t) = &self.thread {
+            if t.is_finished() {
+                self.thread.take();
+            } else {
+                return;
+            }
         }
         let input = self.input.clone();
         let tx = self.media_queue.clone();
@@ -244,10 +268,11 @@ impl MediaPlayer {
         let tbn = self.tbn;
         let running = self.running.clone();
         let audio_sample_rate = self.target_sample_rate.clone();
+
         self.thread = Some(std::thread::spawn(move || {
             running.store(true, Ordering::Relaxed);
             let mut probed: Option<DemuxerInfo> = None;
-            let mut demux = Demuxer::new(&input);
+            let mut demux = Self::open_demuxer(&input);
             let mut decode = Decoder::new();
             let mut scale: Option<Scaler> = None;
             let mut resample: Option<Resample> = None;
@@ -272,7 +297,10 @@ impl MediaPlayer {
                                 }
                             }
                             Err(e) => {
-                                panic!("{}", e);
+                                if let Ok(mut q) = tx.lock() {
+                                    q.push(DecoderMessage::Error(e.to_string()));
+                                }
+                                break;
                             }
                         }
                     }
@@ -285,6 +313,11 @@ impl MediaPlayer {
                         resample = Some(Resample::new(AVSampleFormat::AV_SAMPLE_FMT_FLT, sr, 2))
                     }
 
+                    // unwrap
+                    let probed = probed.as_ref().unwrap();
+                    let scale = scale.as_mut().unwrap();
+                    let resample = resample.as_mut().unwrap();
+
                     let buf_size =
                         max_pts.load(Ordering::Relaxed) - min_pts.load(Ordering::Relaxed);
                     if buf_size > choke_point.load(Ordering::Relaxed) as i64 {
@@ -294,23 +327,16 @@ impl MediaPlayer {
 
                     // read frames
                     let (mut pkt, stream) = demux.get_packet().expect("failed to get packet");
-                    if pkt.is_null() || !probed.as_ref().unwrap().is_best_stream(stream) {
+                    if pkt.is_null() || !probed.is_best_stream(stream) {
                         av_packet_free(&mut pkt);
                         continue;
                     }
 
                     if let Ok(frames) = decode.decode_pkt(pkt, stream) {
-                        let size = target_size.read().unwrap();
+                        let size = target_size.read().expect("failed to read size");
                         for (mut frame, stream) in frames {
                             Self::process_frame(
-                                &tx,
-                                &tbn,
-                                frame,
-                                stream,
-                                scale.as_mut().unwrap(),
-                                resample.as_mut().unwrap(),
-                                size[0],
-                                size[1],
+                                &tx, &tbn, frame, stream, scale, resample, size[0], size[1],
                             );
 
                             let f_pts = av_rescale_q(
@@ -335,8 +361,6 @@ impl MediaPlayer {
                     }
                     av_packet_free(&mut pkt);
                 }
-
-                eprintln!("exit player loop")
             }
         }));
     }

@@ -6,7 +6,7 @@ use cpal::{SampleFormat, Stream, SupportedStreamConfig};
 use egui::load::SizedTexture;
 use egui::text::LayoutJob;
 use egui::{
-    vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Sense, TextFormat,
+    pos2, vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Sense, TextFormat,
     TextureHandle, TextureOptions, Ui, Vec2, Widget,
 };
 use egui_inbox::{UiInbox, UiInboxSender};
@@ -76,6 +76,9 @@ pub struct CustomPlayer<T> {
 
     /// ffmpeg media player
     media_player: MediaPlayer,
+
+    /// An error which prevented playback
+    error: Option<String>,
 }
 
 struct PlayerAudioStream {
@@ -364,7 +367,11 @@ impl<T> CustomPlayer<T> {
                     self.pts_audio = pts;
                 }
                 DecoderMessage::Subtitles(pts, duration, text) => {
-                    self.subtitle = Some(Subtitle::from_text(&text))
+                    self.subtitle = Some(Subtitle::from_text(&text));
+                }
+                DecoderMessage::Error(e) => {
+                    self.error = Some(e);
+                    self.stop();
                 }
             }
         }
@@ -604,6 +611,7 @@ impl<T> CustomPlayer<T> {
             frame_counter: 0,
             last_frame_counter: 0,
             play_start: Instant::now(),
+            error: None,
         }
     }
 }
@@ -703,6 +711,15 @@ where
         let frame_response = self.render_frame(ui);
         self.render_subtitles(ui, &frame_response);
         self.render_overlay(ui, &frame_response);
+        if let Some(error) = &self.error {
+            ui.painter().text(
+                pos2(size.x / 2.0, size.y / 2.0),
+                Align2::CENTER_BOTTOM,
+                error,
+                FontId::proportional(30.),
+                Color32::DARK_RED,
+            );
+        }
         if self.debug {
             self.render_debug(ui, &frame_response);
         }

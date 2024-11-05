@@ -7,6 +7,8 @@
 //! ```
 
 mod audio;
+#[cfg(feature = "hls")]
+mod hls;
 pub mod media_player;
 mod overlay;
 mod player;

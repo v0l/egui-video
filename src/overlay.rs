@@ -203,21 +203,23 @@ impl PlayerOverlay for DefaultOverlay {
             text_color,
         );
 
-        ui.painter().text(
-            duration_text_pos,
-            Align2::LEFT_BOTTOM,
-            if p.duration() > 0.0 {
-                format!(
-                    "{} / {}",
-                    Self::format_time(p.elapsed()),
-                    Self::format_time(p.duration())
-                )
-            } else {
-                Self::format_time(p.elapsed())
-            },
-            duration_text_font_id,
-            text_color,
-        );
+        if p.elapsed().is_finite() {
+            ui.painter().text(
+                duration_text_pos,
+                Align2::LEFT_BOTTOM,
+                if p.duration() > 0.0 {
+                    format!(
+                        "{} / {}",
+                        Self::format_time(p.elapsed()),
+                        Self::format_time(p.duration())
+                    )
+                } else {
+                    Self::format_time(p.elapsed())
+                },
+                duration_text_font_id,
+                text_color,
+            );
+        }
 
         if seekbar_hover_anim_frac > 0. {
             ui.painter().circle_filled(
