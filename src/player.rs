@@ -13,6 +13,7 @@ use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
 use ffmpeg_rs_raw::DemuxerInfo;
 use std::collections::VecDeque;
+use std::ops::Sub;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -40,6 +41,7 @@ enum PlayerMessage {
 /// Initialize once, and use the [`CustomPlayer::ui`] or [`CustomPlayer::ui_at()`] functions to show the playback.
 pub struct CustomPlayer<T> {
     exiting: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     overlay: T,
     player_state: PlayerState,
     looping: bool,
@@ -503,6 +505,7 @@ impl<T> CustomPlayer<T> {
     fn open_default_audio_stream(
         volume: Arc<AtomicU8>,
         exit: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
     ) -> Option<PlayerAudioStream> {
         if let Ok(a) = AudioDevice::new() {
             if let Ok(cfg) = a.0.default_output_config() {
@@ -521,10 +524,12 @@ impl<T> CustomPlayer<T> {
                             if exit.load(Ordering::Relaxed) {
                                 break;
                             }
+                            // do nothing, leave silence in dst
+                            if paused.load(Ordering::Relaxed) {
+                                return;
+                            }
                             if let Ok(mut buf) = b_clone.lock() {
-                                let delay = buf.audio_delay_samples();
-
-                                // data didnt start yet just leave silence
+                                // data didn't start yet just leave silence
                                 if buf.video_pos == 0.0 {
                                     break;
                                 }
@@ -533,6 +538,16 @@ impl<T> CustomPlayer<T> {
                                     drop(buf);
                                     std::thread::sleep(Duration::from_millis(5));
                                     continue;
+                                }
+                                // lazy audio sync
+                                let sync = buf.video_pos.sub(buf.audio_pos);
+                                if sync > 0.1 {
+                                    let drop_samples = 1000.min(buf.samples.len());
+                                    eprintln!("Dropping {} samples", drop_samples);
+                                    buf.take_samples(drop_samples);
+                                } else if sync < -0.1 {
+                                    eprintln!("Sleeping for a bit");
+                                    std::thread::sleep(Duration::from_millis(5));
                                 }
                                 let v = volume.load(Ordering::Relaxed) as f32 / u8::MAX as f32;
                                 let w_len = dst.len().min(buf.samples.len());
@@ -571,8 +586,11 @@ impl<T> CustomPlayer<T> {
         /// exit signal (on drop)
         let exit = Arc::new(AtomicBool::new(false));
 
+        /// paused signal (audio stream pause)
+        let paused = Arc::new(AtomicBool::new(false));
+
         /// Open audio device
-        let audio = Self::open_default_audio_stream(vol.clone(), exit.clone());
+        let audio = Self::open_default_audio_stream(vol.clone(), exit.clone(), paused.clone());
 
         let mut media_player = MediaPlayer::new(input_path);
         if let Some(a) = &audio {
@@ -582,6 +600,7 @@ impl<T> CustomPlayer<T> {
         let init_size = ctx.available_rect();
         Self {
             exiting: exit,
+            paused,
             overlay,
             input_path: input_path.clone(),
             looping: false,
@@ -647,6 +666,7 @@ impl<T> PlayerControls for CustomPlayer<T> {
     /// Pause the stream.
     fn pause(&mut self) {
         self.player_state = PlayerState::Paused;
+        self.paused.store(true, Ordering::Relaxed);
     }
 
     /// Start the stream.
@@ -654,11 +674,13 @@ impl<T> PlayerControls for CustomPlayer<T> {
         self.media_player.start();
         self.player_state = PlayerState::Playing;
         self.play_start = Instant::now();
+        self.paused.store(false, Ordering::Relaxed);
     }
 
     /// Stop the stream.
     fn stop(&mut self) {
         self.player_state = PlayerState::Stopped;
+        self.paused.store(true, Ordering::Relaxed);
     }
 
     /// Seek to a location in the stream.
