@@ -5,38 +5,18 @@
 
 https://github.com/n00kii/egui-video/assets/57325298/c618ff0a-9ad2-4cf0-b14a-dda65dc54b23
 
-plays videos in egui from file path or from bytes
+Plays videos in egui from any source FFMPEG supports.
 
-## dependancies:
+## Dependencies:
  - requires ffmpeg 6 or 7. follow the build instructions [here](https://github.com/zmwangx/rust-ffmpeg/wiki/Notes-on-building)
- - requires sdl2. by default, a feature is enabled to automatically compile it for you, but you are free to disable it and follow [these instructions](https://github.com/Rust-SDL2/rust-sdl2#requirements)
-## usage:
+
+## Usage:
 ```rust
-/* called once (top level initialization) */
-
-{ // if using audio...
-    let audio_device = egui_video::AudioDevice::new()?;
-    
-    // don't let audio_device drop out of memory! (or else you lose audio)
-
-    add_audio_device_to_state_somewhere(audio_device);
-}
-```
-```rust
-/* called once (creating a player) */
-
+// called once (creating a player)
 let mut player = egui_video::Player::new(ctx, my_media_path)?;
-
-{ // if using audio...
-    player = player.with_audio(&mut my_state.audio_device)
-}
-```
-```rust
-/* called every frame (showing the player) */
+player.play();
+// called every frame (showing the player)
 player.ui(ui, player.size);
 ```
-## contributions
+## Contributions
 are welcome :)
-
-### current caveats
- - need to compile in `release` or `opt-level=3` otherwise limited playback performance
