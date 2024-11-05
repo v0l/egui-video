@@ -101,6 +101,14 @@ impl PlayerControls for Player {
     fn set_debug(&mut self, debug: bool) {
         self.inner.set_debug(debug)
     }
+
+    fn playback_speed(&self) -> f32 {
+        self.inner.playback_speed()
+    }
+
+    fn set_playback_speed(&mut self, speed: f32) {
+        self.inner.set_playback_speed(speed)
+    }
 }
 
 impl Widget for &mut Player {

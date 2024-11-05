@@ -7,11 +7,16 @@ use crate::hls::DemuxerIsh;
 #[cfg(feature = "hls")]
 use crate::hls::HlsStream;
 
+use crate::ffmpeg_sys_the_third::AVHWDeviceType::AV_HWDEVICE_TYPE_MEDIACODEC;
 use egui::{Color32, ColorImage, Vec2};
+use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVHWDeviceType::{
+    AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VDPAU,
+};
 use ffmpeg_rs_raw::{Decoder, Demuxer, DemuxerInfo, Resample, Scaler};
 use std::collections::BinaryHeap;
 use std::mem::transmute;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -137,7 +142,13 @@ pub struct MediaPlayer {
     /// Number of timebase units of frames to store in [media_queue] (using [pts_max]/[pts_in])
     target_buffer_size: Arc<AtomicU32>,
 
+    /// Queue of frames/subtitles/audio samples
     media_queue: Arc<Mutex<BinaryHeap<DecoderMessage>>>,
+
+    /// Audio channel to bypass [media_queue]
+    /// Audio needs more buffering than video frames
+    audio_chan: Option<std::sync::mpsc::Sender<DecoderMessage>>,
+
     pub tbn: AVRational,
 }
 
@@ -166,12 +177,18 @@ impl MediaPlayer {
             pts_min: Arc::new(AtomicI64::new(0)),
             running: Arc::new(AtomicBool::new(true)),
             media_queue: Arc::new(Mutex::new(BinaryHeap::new())),
+            audio_chan: None,
             tbn: AVRational {
                 num: 1,
                 den: DEFAULT_TBN,
             },
             target_buffer_size: Arc::new(AtomicU32::new(DEFAULT_TBN as u32 * 2)),
         }
+    }
+
+    pub fn with_audio_chan(mut self, chan: Sender<DecoderMessage>) -> Self {
+        self.audio_chan = Some(chan);
+        self
     }
 
     /// Get the size of the buffer as AV_TIMEBASE units
@@ -268,6 +285,7 @@ impl MediaPlayer {
         let tbn = self.tbn;
         let running = self.running.clone();
         let audio_sample_rate = self.target_sample_rate.clone();
+        let audio_tx = self.audio_chan.clone();
 
         self.thread = Some(std::thread::spawn(move || {
             running.store(true, Ordering::Relaxed);
@@ -277,6 +295,9 @@ impl MediaPlayer {
             let mut scale: Option<Scaler> = None;
             let mut resample: Option<Resample> = None;
 
+            decode.enable_hw_decoder(AV_HWDEVICE_TYPE_VDPAU);
+            decode.enable_hw_decoder(AV_HWDEVICE_TYPE_CUDA);
+            decode.enable_hw_decoder(AV_HWDEVICE_TYPE_MEDIACODEC);
             unsafe {
                 loop {
                     if !running.load(Ordering::Relaxed) {
@@ -292,6 +313,7 @@ impl MediaPlayer {
                                         .setup_decoder(c, None)
                                         .expect("Failed to setup decoder");
                                 }
+                                eprintln!("{}", decode);
                                 if let Ok(mut q) = tx.lock() {
                                     q.push(DecoderMessage::MediaInfo(p));
                                 }
@@ -336,7 +358,15 @@ impl MediaPlayer {
                         let size = target_size.read().expect("failed to read size");
                         for (mut frame, stream) in frames {
                             Self::process_frame(
-                                &tx, &tbn, frame, stream, scale, resample, size[0], size[1],
+                                &tx,
+                                &tbn,
+                                frame,
+                                stream,
+                                scale,
+                                resample,
+                                size[0],
+                                size[1],
+                                audio_tx.clone(),
                             );
 
                             let f_pts = av_rescale_q(
@@ -375,6 +405,7 @@ impl MediaPlayer {
         resample: &mut Resample,
         width: u16,
         height: u16,
+        audio_chan: Option<Sender<DecoderMessage>>,
     ) {
         unsafe {
             let pts = av_rescale_q(
@@ -406,12 +437,13 @@ impl MediaPlayer {
                         let size = ((*frame).nb_samples * plane_mul) as usize;
 
                         let samples = slice::from_raw_parts((*frame).data[0] as *const f32, size);
-                        if let Ok(mut q) = tx.lock() {
-                            q.push(DecoderMessage::AudioSamples(
-                                pts,
-                                duration,
-                                samples.to_vec(),
-                            ));
+                        let msg = DecoderMessage::AudioSamples(pts, duration, samples.to_vec());
+                        if let Some(atx) = audio_chan {
+                            atx.send(msg).expect("Failed to write audio to channel");
+                        } else {
+                            if let Ok(mut q) = tx.lock() {
+                                q.push(msg);
+                            }
                         }
                         av_frame_free(&mut frame);
                     }
