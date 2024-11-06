@@ -64,7 +64,7 @@ impl AudioBuffer {
 
     pub fn take_samples(&mut self, n: usize) -> Vec<f32> {
         assert_eq!(0, n % self.channels as usize, "Must be a multiple of 2");
-        let will_drain = self.samples.drain(..n);
+        let will_drain = self.samples.drain(..n.min(self.samples.len()));
         self.audio_pos += will_drain.len() as f32 / self.sample_rate as f32 / self.channels as f32;
         will_drain.collect()
     }
