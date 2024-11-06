@@ -17,7 +17,6 @@ use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -54,7 +53,6 @@ pub struct CustomPlayer<T> {
     avg_fps: f32,
     avg_fps_start: Instant,
     last_frame_counter: u64,
-    pts_audio: i64,
 
     /// The video frame to display
     frame: TextureHandle,
@@ -64,12 +62,8 @@ pub struct CustomPlayer<T> {
     frame_duration: i64,
     /// Realtime of when [frame] was shown
     frame_start: Instant,
-    /// When playback was started
-    play_start: Instant,
     /// How many frames have been rendered so far
     frame_counter: u64,
-
-    frame_timer: Option<JoinHandle<()>>,
 
     /// Stream info
     info: Option<DemuxerInfo>,
@@ -123,7 +117,7 @@ impl AudioBuffer {
 
     pub fn take_samples(&mut self, n: usize) -> Vec<f32> {
         assert_eq!(0, n % self.channels as usize, "Must be a multiple of 2");
-        self.audio_pos += (n as f32 / self.sample_rate as f32 / self.channels as f32);
+        self.audio_pos += n as f32 / self.sample_rate as f32 / self.channels as f32;
         self.samples.drain(..n).collect()
     }
 
@@ -294,9 +288,6 @@ pub trait PlayerOverlay {
 impl<T> Drop for CustomPlayer<T> {
     fn drop(&mut self) {
         self.exiting.store(true, Ordering::Relaxed);
-        if let Some(j) = self.frame_timer.take() {
-            j.join().unwrap();
-        }
     }
 }
 
@@ -318,6 +309,24 @@ impl<T> CustomPlayer<T> {
         self.frame_start = Instant::now() - frame_delay;
     }
 
+    fn request_repaint_for_next_frame(&self) {
+        let now = Instant::now();
+        let next_frame = self.next_frame_timestamp();
+        if now > next_frame {
+            trace!("request repaint now!");
+            self.ctx.request_repaint();
+        } else {
+            let ttnf = next_frame - now;
+            trace!("request repaint for {}ms", ttnf.as_millis());
+            self.ctx.request_repaint_after(ttnf);
+        }
+    }
+
+    /// Timestamp when the next frame should be shown
+    fn next_frame_timestamp(&self) -> Instant {
+        self.frame_start + self.pts_to_duration(self.frame_duration)
+    }
+
     /// Check if the current frame should be flipped
     fn check_load_frame(&mut self) -> bool {
         if self.player_state != PlayerState::Playing {
@@ -326,11 +335,7 @@ impl<T> CustomPlayer<T> {
             return false;
         }
         let now = Instant::now();
-        now >= (self.frame_start + self.pts_to_duration(self.frame_duration))
-    }
-
-    fn next_frame_max_pts(&self) -> i64 {
-        self.frame_pts + self.frame_duration + self.frame_duration
+        now >= self.next_frame_timestamp()
     }
 
     fn process_state(&mut self, size: Vec2) {
@@ -338,6 +343,7 @@ impl<T> CustomPlayer<T> {
 
         // check if we should load the next video frame
         if !self.check_load_frame() {
+            self.request_repaint_for_next_frame();
             return;
         }
 
@@ -355,24 +361,8 @@ impl<T> CustomPlayer<T> {
             match msg {
                 DecoderMessage::MediaInfo(i) => {
                     self.info = Some(i);
-                    let fps = self.framerate();
-                    if fps > 0.0 {
-                        let cx = self.ctx.clone();
-                        let closing = self.exiting.clone();
-                        self.frame_timer = Some(std::thread::spawn(move || loop {
-                            if closing.load(Ordering::Relaxed) {
-                                break;
-                            }
-                            cx.request_repaint();
-                            std::thread::sleep(Duration::from_secs_f32(0.5 / fps));
-                        }));
-                    }
                 }
                 DecoderMessage::VideoFrame(pts, duration, f) => {
-                    if self.frame_counter == 0 {
-                        self.play_start = Instant::now();
-                    }
-
                     self.load_frame(f, pts, duration);
 
                     let v_pts = self.pts_to_sec(self.frame_pts);
@@ -384,6 +374,7 @@ impl<T> CustomPlayer<T> {
                     // break on video frame
                     // once we load the next frame this loop will not call again until
                     // this frame is over (pts + duration)
+                    self.request_repaint_for_next_frame();
                     break;
                 }
                 DecoderMessage::AudioSamples(pts, duration, s) => {
@@ -392,7 +383,6 @@ impl<T> CustomPlayer<T> {
                             q.add_samples(s);
                         }
                     }
-                    self.pts_audio = pts;
                 }
                 DecoderMessage::Subtitles(pts, duration, text) => {
                     self.subtitle = Some(Subtitle::from_text(&text));
@@ -403,6 +393,9 @@ impl<T> CustomPlayer<T> {
                 }
             }
         }
+
+        // if no frames were found just request repaint again
+        self.request_repaint_for_next_frame();
     }
 
     fn process_player_message(&mut self, m: PlayerMessage) {
@@ -547,7 +540,7 @@ impl<T> CustomPlayer<T> {
                     &cfg.config(),
                     SampleFormat::F32,
                     move |data: &mut cpal::Data, info: &cpal::OutputCallbackInfo| {
-                        let mut dst: &mut [f32] = data.as_slice_mut().unwrap();
+                        let dst: &mut [f32] = data.as_slice_mut().unwrap();
                         dst.fill(0.0);
                         loop {
                             if exit.load(Ordering::Relaxed) {
@@ -640,7 +633,6 @@ impl<T> CustomPlayer<T> {
             looping: false,
             volume: vol,
             player_state: PlayerState::Stopped,
-            pts_audio: 0,
             frame: ctx.load_texture(
                 "video_frame",
                 ColorImage::new(
@@ -652,7 +644,6 @@ impl<T> CustomPlayer<T> {
             frame_start: Instant::now(),
             frame_pts: 0,
             frame_duration: 0,
-            frame_timer: None,
             info: None,
             ctx: ctx.clone(),
             audio,
@@ -663,7 +654,6 @@ impl<T> CustomPlayer<T> {
             avg_fps_start: Instant::now(),
             frame_counter: 0,
             last_frame_counter: 0,
-            play_start: Instant::now(),
             error: None,
         }
     }
@@ -709,7 +699,6 @@ impl<T> PlayerControls for CustomPlayer<T> {
     fn start(&mut self) {
         self.media_player.start();
         self.player_state = PlayerState::Playing;
-        self.play_start = Instant::now();
         self.audio
             .as_ref()
             .map(|b| b.buffer.lock().map(|mut c| c.paused = false));

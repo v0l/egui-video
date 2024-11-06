@@ -7,12 +7,9 @@ use crate::hls::DemuxerIsh;
 #[cfg(feature = "hls")]
 use crate::hls::HlsStream;
 
-use crate::ffmpeg_sys_the_third::AVHWDeviceType::AV_HWDEVICE_TYPE_MEDIACODEC;
+use anyhow::Error;
 use egui::{Color32, ColorImage, Vec2};
-use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVHWDeviceType::{
-    AV_HWDEVICE_TYPE_CUDA, AV_HWDEVICE_TYPE_VDPAU,
-};
-use ffmpeg_rs_raw::{Decoder, Demuxer, DemuxerInfo, Resample, Scaler};
+use ffmpeg_rs_raw::{get_frame_from_hw, Decoder, Demuxer, DemuxerInfo, Resample, Scaler};
 use std::collections::BinaryHeap;
 use std::mem::transmute;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering};
@@ -59,7 +56,7 @@ pub unsafe fn video_frame_to_image(mut frame: *mut AVFrame) -> ColorImage {
 unsafe fn map_frame_to_pixels(frame: *mut AVFrame) -> Vec<Color32> {
     let stride = (*frame).linesize[0] as usize;
     let lines = (*frame).height as usize;
-    let mut data = slice::from_raw_parts_mut((*frame).data[0], stride * lines);
+    let data = slice::from_raw_parts_mut((*frame).data[0], stride * lines);
     let bytes = match transmute((*frame).format) {
         AVPixelFormat::AV_PIX_FMT_RGB24 => 3,
         AVPixelFormat::AV_PIX_FMT_RGBA => 4,
@@ -295,9 +292,7 @@ impl MediaPlayer {
             let mut scale: Option<Scaler> = None;
             let mut resample: Option<Resample> = None;
 
-            decode.enable_hw_decoder(AV_HWDEVICE_TYPE_VDPAU);
-            decode.enable_hw_decoder(AV_HWDEVICE_TYPE_CUDA);
-            decode.enable_hw_decoder(AV_HWDEVICE_TYPE_MEDIACODEC);
+            decode.enable_hw_decoder_any();
             unsafe {
                 loop {
                     if !running.load(Ordering::Relaxed) {
@@ -328,7 +323,7 @@ impl MediaPlayer {
                     }
 
                     if scale.is_none() {
-                        scale = Some(Scaler::new(AVPixelFormat::AV_PIX_FMT_RGBA))
+                        scale = Some(Scaler::new())
                     }
                     if resample.is_none() {
                         let sr = audio_sample_rate.load(Ordering::Relaxed);
@@ -349,15 +344,15 @@ impl MediaPlayer {
 
                     // read frames
                     let (mut pkt, stream) = demux.get_packet().expect("failed to get packet");
-                    if pkt.is_null() || !probed.is_best_stream(stream) {
+                    if !probed.is_best_stream(stream) {
                         av_packet_free(&mut pkt);
                         continue;
                     }
 
                     if let Ok(frames) = decode.decode_pkt(pkt, stream) {
                         let size = target_size.read().expect("failed to read size");
-                        for (mut frame, stream) in frames {
-                            Self::process_frame(
+                        for (frame, stream) in frames {
+                            match Self::process_frame(
                                 &tx,
                                 &tbn,
                                 frame,
@@ -367,22 +362,29 @@ impl MediaPlayer {
                                 size[0],
                                 size[1],
                                 audio_tx.clone(),
-                            );
+                            ) {
+                                Err(e) => panic!("{}", e),
+                                Ok(mut frame) => {
+                                    let f_pts = av_rescale_q(
+                                        (*frame).pts - (*stream).start_time,
+                                        (*stream).time_base,
+                                        tbn,
+                                    );
+                                    let _ = max_pts.fetch_update(
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                        |v| {
+                                            if f_pts > v {
+                                                Some(f_pts)
+                                            } else {
+                                                None
+                                            }
+                                        },
+                                    );
 
-                            let f_pts = av_rescale_q(
-                                (*frame).pts - (*stream).start_time,
-                                (*stream).time_base,
-                                tbn,
-                            );
-                            let _ = max_pts.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                                if f_pts > v {
-                                    Some(f_pts)
-                                } else {
-                                    None
+                                    av_frame_free(&mut frame);
                                 }
-                            });
-
-                            av_frame_free(&mut frame);
+                            }
                         }
                     }
 
@@ -406,57 +408,47 @@ impl MediaPlayer {
         width: u16,
         height: u16,
         audio_chan: Option<Sender<DecoderMessage>>,
-    ) {
-        unsafe {
-            let pts = av_rescale_q(
-                (*frame).pts - (*stream).start_time,
-                (*stream).time_base,
-                *tbn,
-            );
-            let duration = av_rescale_q((*frame).duration, (*stream).time_base, *tbn);
+    ) -> Result<*mut AVFrame, Error> {
+        let frame = get_frame_from_hw(frame)?;
+        let pts = av_rescale_q(
+            (*frame).pts - (*stream).start_time,
+            (*stream).time_base,
+            *tbn,
+        );
+        let duration = av_rescale_q((*frame).duration, (*stream).time_base, *tbn);
+        let media_type = (*(*stream).codecpar).codec_type;
 
-            if (*(*stream).codecpar).codec_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
-                match scale.process_frame(frame, width, height) {
-                    Ok(frame) => {
-                        let image = video_frame_to_image(frame);
-                        if let Ok(mut q) = tx.lock() {
-                            q.push(DecoderMessage::VideoFrame(pts, duration, image));
-                        }
-                    }
-                    Err(e) => panic!("{}", e),
-                }
-            } else if (*(*stream).codecpar).codec_type == AVMediaType::AVMEDIA_TYPE_AUDIO {
-                match resample.process_frame(frame) {
-                    Ok(mut frame) => {
-                        let is_planar = av_sample_fmt_is_planar(transmute((*frame).format)) == 1;
-                        let plane_mul = if is_planar {
-                            1
-                        } else {
-                            (*frame).ch_layout.nb_channels
-                        };
-                        let size = ((*frame).nb_samples * plane_mul) as usize;
+        if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
+            let frame =
+                scale.process_frame(frame, width, height, AVPixelFormat::AV_PIX_FMT_RGBA)?;
+            let image = video_frame_to_image(frame);
+            let mut q = tx.lock().expect("failed to lock tx");
+            q.push(DecoderMessage::VideoFrame(pts, duration, image));
+        } else if media_type == AVMediaType::AVMEDIA_TYPE_AUDIO {
+            let mut frame = resample.process_frame(frame)?;
+            let is_planar = av_sample_fmt_is_planar(transmute((*frame).format)) == 1;
+            let plane_mul = if is_planar {
+                1
+            } else {
+                (*frame).ch_layout.nb_channels
+            };
+            let size = ((*frame).nb_samples * plane_mul) as usize;
 
-                        let samples = slice::from_raw_parts((*frame).data[0] as *const f32, size);
-                        let msg = DecoderMessage::AudioSamples(pts, duration, samples.to_vec());
-                        if let Some(atx) = audio_chan {
-                            atx.send(msg).expect("Failed to write audio to channel");
-                        } else {
-                            if let Ok(mut q) = tx.lock() {
-                                q.push(msg);
-                            }
-                        }
-                        av_frame_free(&mut frame);
-                    }
-                    Err(e) => panic!("{}", e),
-                }
-            } else if (*(*stream).codecpar).codec_type == AVMediaType::AVMEDIA_TYPE_SUBTITLE {
-                let str: &[u8] =
-                    slice::from_raw_parts((*frame).data[0], (*frame).linesize[0] as usize);
-                let str = String::from_utf8_lossy(str).to_string();
-                if let Ok(mut q) = tx.lock() {
-                    q.push(DecoderMessage::Subtitles(pts, duration, str));
-                }
+            let samples = slice::from_raw_parts((*frame).data[0] as *const f32, size);
+            let msg = DecoderMessage::AudioSamples(pts, duration, samples.to_vec());
+            if let Some(atx) = audio_chan {
+                atx.send(msg)?;
+            } else {
+                let mut q = tx.lock().expect("failed to lock tx");
+                q.push(msg);
             }
+            av_frame_free(&mut frame);
+        } else if media_type == AVMediaType::AVMEDIA_TYPE_SUBTITLE {
+            let str: &[u8] = slice::from_raw_parts((*frame).data[0], (*frame).linesize[0] as usize);
+            let str = String::from_utf8_lossy(str).to_string();
+            let mut q = tx.lock().expect("failed to lock tx");
+            q.push(DecoderMessage::Subtitles(pts, duration, str));
         }
+        Ok(frame)
     }
 }

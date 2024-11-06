@@ -1,4 +1,4 @@
-use eframe::{NativeOptions, Renderer};
+use eframe::NativeOptions;
 use egui::{vec2, CentralPanel, TextEdit, Widget};
 use egui_video::{AudioDevice, Player, PlayerControls};
 
