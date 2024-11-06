@@ -1,8 +1,10 @@
+#[allow(integer_atomics)]
+use crate::audio::{AudioBuffer, PlayerAudioStream};
 use crate::media_player::{DecoderMessage, MediaPlayer};
 use crate::subtitle::Subtitle;
 use crate::AudioDevice;
 use cpal::traits::DeviceTrait;
-use cpal::{SampleFormat, Stream, SupportedStreamConfig};
+use cpal::SampleFormat;
 use egui::load::SizedTexture;
 use egui::text::LayoutJob;
 use egui::{
@@ -13,8 +15,7 @@ use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
 use ffmpeg_rs_raw::DemuxerInfo;
 use log::trace;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -42,9 +43,8 @@ enum PlayerMessage {
 /// This is what you use to show a video file.
 /// Initialize once, and use the [`CustomPlayer::ui`] or [`CustomPlayer::ui_at()`] functions to show the playback.
 pub struct CustomPlayer<T> {
-    exiting: Arc<AtomicBool>,
+    state: Arc<AtomicU8>,
     overlay: T,
-    player_state: PlayerState,
     looping: bool,
     volume: Arc<AtomicU8>,
     playback_speed: Arc<AtomicU8>,
@@ -80,81 +80,19 @@ pub struct CustomPlayer<T> {
     error: Option<String>,
 }
 
-struct PlayerAudioStream {
-    pub device: AudioDevice,
-    pub config: SupportedStreamConfig,
-    pub stream: Stream,
-    pub buffer: Arc<Mutex<AudioBuffer>>,
-}
-
-struct AudioBuffer {
-    channels: u8,
-    sample_rate: u32,
-    paused: bool,
-    // buffered samples
-    samples: VecDeque<f32>,
-    /// Video position in seconds
-    video_pos: f32,
-    /// Audio position in seconds
-    audio_pos: f32,
-}
-
-impl AudioBuffer {
-    pub fn new(sample_rate: u32, channels: u8) -> Self {
-        Self {
-            channels,
-            sample_rate,
-            paused: false,
-            samples: VecDeque::new(),
-            video_pos: 0.0,
-            audio_pos: 0.0,
-        }
-    }
-
-    pub fn add_samples(&mut self, samples: Vec<f32>) {
-        self.samples.extend(samples);
-    }
-
-    pub fn take_samples(&mut self, n: usize) -> Vec<f32> {
-        assert_eq!(0, n % self.channels as usize, "Must be a multiple of 2");
-        self.audio_pos += n as f32 / self.sample_rate as f32 / self.channels as f32;
-        self.samples.drain(..n).collect()
-    }
-
-    pub fn set_video_pos(&mut self, pos: f32) {
-        self.video_pos = pos;
-    }
-
-    pub fn audio_delay_secs(&self) -> f32 {
-        self.video_pos - self.audio_pos
-    }
-
-    pub fn audio_delay_samples(&self) -> isize {
-        let samples_f32 = self.sample_rate as f32 * self.audio_delay_secs();
-        samples_f32 as isize * self.channels as isize
-    }
-
-    pub fn pause(&mut self, paused: bool) {
-        self.paused = paused;
-    }
-}
-
 /// The possible states of a [`CustomPlayer`].
-#[repr(u8)]
 #[derive(PartialEq, Clone, Copy, Debug)]
+#[repr(u8)]
+#[non_exhaustive]
 pub enum PlayerState {
     /// No playback.
     Stopped,
-    /// Streams have reached the end of the file.
-    EndOfFile,
     /// Stream is seeking. Inner bool represents whether the seek is currently in progress.
-    Seeking(bool),
+    Seeking,
     /// Playback is paused.
     Paused,
     /// Playback is ongoing.
     Playing,
-    /// Playback is scheduled to restart.
-    Restarting,
 }
 
 pub trait PlayerControls {
@@ -287,7 +225,8 @@ pub trait PlayerOverlay {
 
 impl<T> Drop for CustomPlayer<T> {
     fn drop(&mut self) {
-        self.exiting.store(true, Ordering::Relaxed);
+        self.state
+            .store(PlayerState::Stopped as u8, Ordering::Relaxed);
     }
 }
 
@@ -329,7 +268,7 @@ impl<T> CustomPlayer<T> {
 
     /// Check if the current frame should be flipped
     fn check_load_frame(&mut self) -> bool {
-        if self.player_state != PlayerState::Playing {
+        if self.state.load(Ordering::Relaxed) == PlayerState::Paused as u8 {
             // force frame to start now, while paused
             self.frame_start = Instant::now();
             return false;
@@ -339,6 +278,11 @@ impl<T> CustomPlayer<T> {
     }
 
     fn process_state(&mut self, size: Vec2) {
+        if self.state.load(Ordering::Relaxed) == PlayerState::Stopped as u8 {
+            // nothing to do, playback is stopped
+            return;
+        }
+
         self.media_player.set_target_size(size);
 
         // check if we should load the next video frame
@@ -368,7 +312,7 @@ impl<T> CustomPlayer<T> {
                     let v_pts = self.pts_to_sec(self.frame_pts);
                     if let Some(a) = self.audio.as_mut() {
                         if let Ok(mut q) = a.buffer.lock() {
-                            q.set_video_pos(v_pts as f32);
+                            q.video_pos = v_pts as f32;
                         }
                     }
                     // break on video frame
@@ -391,6 +335,14 @@ impl<T> CustomPlayer<T> {
                     self.error = Some(e);
                     self.stop();
                 }
+            }
+        }
+
+        if !self.media_player.is_running() && self.media_player.buffer_len() == 0 {
+            trace!("stopping, media_player is not running");
+            self.stop();
+            if self.looping {
+                self.start();
             }
         }
 
@@ -474,11 +426,11 @@ impl<T> CustomPlayer<T> {
 
     fn debug_inner(&mut self) -> LayoutJob {
         let v_pts = self.elapsed();
-        let a_pts = if let Some(a) = self.audio.as_ref() {
-            a.buffer.lock().map_or(0.0, |a| a.audio_pos)
-        } else {
-            0.0
-        };
+        let a_pts = self
+            .audio
+            .as_ref()
+            .map(|a| a.buffer.lock().map(|b| b.audio_pos).unwrap_or(0.0))
+            .unwrap_or(0.0);
         let font = TextFormat::simple(FontId::monospace(11.), Color32::WHITE);
 
         let mut layout = LayoutJob::default();
@@ -526,7 +478,7 @@ impl<T> CustomPlayer<T> {
 
     fn open_default_audio_stream(
         volume: Arc<AtomicU8>,
-        exit: Arc<AtomicBool>,
+        state: Arc<AtomicU8>,
         rx: Receiver<DecoderMessage>,
     ) -> Option<PlayerAudioStream> {
         if let Ok(a) = AudioDevice::new() {
@@ -536,6 +488,7 @@ impl<T> CustomPlayer<T> {
                     cfg.channels() as u8,
                 )));
                 let b_clone = buffer.clone();
+                let i_state = state.clone();
                 if let Ok(stream) = a.0.build_output_stream_raw(
                     &cfg.config(),
                     SampleFormat::F32,
@@ -543,7 +496,8 @@ impl<T> CustomPlayer<T> {
                         let dst: &mut [f32] = data.as_slice_mut().unwrap();
                         dst.fill(0.0);
                         loop {
-                            if exit.load(Ordering::Relaxed) {
+                            let state = i_state.load(Ordering::Relaxed);
+                            if state == PlayerState::Stopped as u8 {
                                 break;
                             }
                             if let Ok(mut buf) = b_clone.lock() {
@@ -557,7 +511,7 @@ impl<T> CustomPlayer<T> {
                                     }
                                 }
                                 // do nothing, leave silence in dst
-                                if buf.paused {
+                                if state == PlayerState::Paused as u8 {
                                     break;
                                 }
                                 // data didn't start yet just leave silence
@@ -572,7 +526,7 @@ impl<T> CustomPlayer<T> {
                                     continue;
                                 }
                                 // lazy audio sync
-                                let sync = buf.audio_delay_secs();
+                                let sync = buf.video_pos - buf.audio_pos;
                                 if sync > 0.05 {
                                     let drop_samples = buf.audio_delay_samples() as usize;
                                     buf.take_samples(drop_samples);
@@ -598,6 +552,7 @@ impl<T> CustomPlayer<T> {
                         device: a,
                         config: cfg,
                         stream,
+                        player_state: state.clone(),
                         buffer,
                     });
                 }
@@ -611,13 +566,12 @@ impl<T> CustomPlayer<T> {
     pub fn new(overlay: T, ctx: &egui::Context, input_path: &String) -> Self {
         /// volume arc
         let vol = Arc::new(AtomicU8::new(200));
-        /// exit signal (on drop)
-        let exit = Arc::new(AtomicBool::new(false));
+        let state = Arc::new(AtomicU8::new(PlayerState::Stopped as u8));
         let playback_speed = Arc::new(AtomicU8::new(127));
 
         /// Open audio device
         let (tx, rx) = mpsc::channel();
-        let audio = Self::open_default_audio_stream(vol.clone(), exit.clone(), rx);
+        let audio = Self::open_default_audio_stream(vol.clone(), state.clone(), rx);
 
         let mut media_player = MediaPlayer::new(input_path).with_audio_chan(tx);
         if let Some(a) = &audio {
@@ -626,13 +580,12 @@ impl<T> CustomPlayer<T> {
 
         let init_size = ctx.available_rect();
         Self {
-            exiting: exit,
+            state,
             playback_speed,
             overlay,
             input_path: input_path.clone(),
-            looping: false,
+            looping: true,
             volume: vol,
-            player_state: PlayerState::Stopped,
             frame: ctx.load_texture(
                 "video_frame",
                 ColorImage::new(
@@ -684,37 +637,54 @@ impl<T> PlayerControls for CustomPlayer<T> {
     }
 
     fn state(&self) -> PlayerState {
-        self.player_state
+        match self.state.load(Ordering::Relaxed) {
+            0 => PlayerState::Stopped,
+            1 => PlayerState::Seeking,
+            2 => PlayerState::Paused,
+            3 => PlayerState::Playing,
+            _ => panic!("Unexpected state"),
+        }
     }
 
     /// Pause the stream.
     fn pause(&mut self) {
-        self.player_state = PlayerState::Paused;
-        self.audio
-            .as_ref()
-            .map(|b| b.buffer.lock().map(|mut c| c.paused = true));
+        self.state
+            .store(PlayerState::Paused as u8, Ordering::Relaxed);
     }
 
     /// Start the stream.
     fn start(&mut self) {
-        self.media_player.start();
-        self.player_state = PlayerState::Playing;
-        self.audio
-            .as_ref()
-            .map(|b| b.buffer.lock().map(|mut c| c.paused = false));
+        self.state
+            .store(PlayerState::Playing as u8, Ordering::Relaxed);
+        if self.media_player.start() {
+            self.frame_counter = 0;
+            self.frame_start = Instant::now();
+            self.frame_duration = 0;
+            self.frame_pts = 0;
+            self.last_frame_counter = 0;
+            self.info = None;
+            self.error = None;
+            self.avg_fps = 0.0;
+            self.avg_fps_start = Instant::now();
+            self.subtitle = None;
+            if let Some(q) = self.audio.as_ref() {
+                if let Ok(mut q) = q.buffer.lock() {
+                    q.audio_pos = 0.0;
+                    q.video_pos = 0.0;
+                }
+            }
+        }
     }
 
     /// Stop the stream.
     fn stop(&mut self) {
-        self.player_state = PlayerState::Stopped;
-        self.audio
-            .as_ref()
-            .map(|b| b.buffer.lock().map(|mut c| c.paused = true));
+        self.state
+            .store(PlayerState::Stopped as u8, Ordering::Relaxed);
     }
 
     /// Seek to a location in the stream.
     fn seek(&mut self, seek_frac: f32) {
-        // TODO: set target PTS
+        todo!()
     }
 
     fn set_volume(&mut self, volume: u8) {

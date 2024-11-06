@@ -31,7 +31,7 @@ impl DefaultOverlay {
 impl PlayerOverlay for DefaultOverlay {
     fn show(&self, ui: &mut Ui, frame_response: &Response, p: &mut PlayerOverlayState) {
         let hovered = ui.rect_contains_pointer(frame_response.rect);
-        let currently_seeking = matches!(p.state(), PlayerState::Seeking(_));
+        let currently_seeking = matches!(p.state(), PlayerState::Seeking);
         let is_stopped = matches!(p.state(), PlayerState::Stopped);
         let is_paused = matches!(p.state(), PlayerState::Paused);
         let animation_time = 0.2;
@@ -232,7 +232,6 @@ impl PlayerOverlay for DefaultOverlay {
         if frame_response.clicked() {
             match p.state() {
                 PlayerState::Stopped => p.start(),
-                PlayerState::EndOfFile => p.start(),
                 PlayerState::Paused => p.start(),
                 PlayerState::Playing => p.pause(),
                 _ => (),

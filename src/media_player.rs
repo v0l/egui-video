@@ -195,6 +195,11 @@ impl MediaPlayer {
         max - min
     }
 
+    /// Get the number of messages in the queue
+    pub fn buffer_len(&self) -> usize {
+        self.media_queue.lock().map(|q| q.len()).unwrap_or(0)
+    }
+
     /// Set the video target size in pixels
     pub fn set_target_size(&mut self, size: Vec2) {
         if let Ok(mut s) = self.target_size.write() {
@@ -216,12 +221,19 @@ impl MediaPlayer {
     pub fn next(&mut self) -> Option<DecoderMessage> {
         if let Ok(mut q) = self.media_queue.lock() {
             let r = q.pop();
-            if let Some(DecoderMessage::VideoFrame(pts, _, _)) = r.as_ref() {
-                self.pts_min.store(*pts, Ordering::Relaxed);
-            }
+            self.store_min_pts(r.as_ref());
             r
         } else {
             None
+        }
+    }
+
+    fn store_min_pts(&self, r: Option<&DecoderMessage>) {
+        if let Some(m) = r.as_ref() {
+            let pts = m.pts();
+            if pts != 0 {
+                self.pts_min.store(pts, Ordering::Relaxed);
+            }
         }
     }
 
@@ -234,9 +246,7 @@ impl MediaPlayer {
             if let Some(r) = q.peek() {
                 if f_check(r) {
                     let r = q.pop();
-                    if let Some(DecoderMessage::VideoFrame(pts, _, _)) = r.as_ref() {
-                        self.pts_min.store(*pts, Ordering::Relaxed);
-                    }
+                    self.store_min_pts(r.as_ref());
                     return r;
                 }
             }
@@ -248,6 +258,14 @@ impl MediaPlayer {
         self.running.store(false, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             thread.join().expect("join failed");
+        }
+    }
+
+    pub fn is_running(&self) -> bool {
+        if let Some(t) = self.thread.as_ref() {
+            !t.is_finished()
+        } else {
+            false
         }
     }
 
@@ -265,12 +283,12 @@ impl MediaPlayer {
         Demuxer::new(input)
     }
 
-    pub fn start(&mut self) {
+    pub fn start(&mut self) -> bool {
         if let Some(t) = &self.thread {
             if t.is_finished() {
                 self.thread.take();
             } else {
-                return;
+                return false;
             }
         }
         let input = self.input.clone();
@@ -283,9 +301,11 @@ impl MediaPlayer {
         let running = self.running.clone();
         let audio_sample_rate = self.target_sample_rate.clone();
         let audio_tx = self.audio_chan.clone();
+        running.store(true, Ordering::Relaxed);
+        max_pts.store(0, Ordering::Relaxed);
+        min_pts.store(0, Ordering::Relaxed);
 
         self.thread = Some(std::thread::spawn(move || {
-            running.store(true, Ordering::Relaxed);
             let mut probed: Option<DemuxerInfo> = None;
             let mut demux = Self::open_demuxer(&input);
             let mut decode = Decoder::new();
@@ -344,7 +364,7 @@ impl MediaPlayer {
 
                     // read frames
                     let (mut pkt, stream) = demux.get_packet().expect("failed to get packet");
-                    if !probed.is_best_stream(stream) {
+                    if !stream.is_null() && !pkt.is_null() && !probed.is_best_stream(stream) {
                         av_packet_free(&mut pkt);
                         continue;
                     }
@@ -394,7 +414,9 @@ impl MediaPlayer {
                     av_packet_free(&mut pkt);
                 }
             }
+            running.store(false, Ordering::Relaxed);
         }));
+        true
     }
 
     /// Send decoded frames to player
