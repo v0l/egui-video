@@ -8,8 +8,9 @@ use cpal::SampleFormat;
 use egui::load::SizedTexture;
 use egui::text::LayoutJob;
 use egui::{
-    pos2, vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Sense, Stroke,
-    TextFormat, TextureHandle, TextureOptions, Ui, Vec2, Widget,
+    pos2, vec2, Align2, Color32, ColorImage, Event, FontId, Image, Key, Rect, Response, Sense,
+    Stroke, TextFormat, TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand, ViewportId,
+    Widget,
 };
 use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
@@ -71,6 +72,8 @@ pub struct CustomPlayer<T> {
     frame_counter: u64,
     /// Maintain video aspect ratio
     maintain_aspect: bool,
+    /// If player should fullscreen
+    fullscreen: bool,
 
     /// Stream info
     info: Option<DemuxerInfo>,
@@ -295,6 +298,60 @@ impl<T> CustomPlayer<T> {
         }
         let now = Instant::now();
         now >= self.next_frame_timestamp()
+    }
+
+    /// Toggle playback
+    fn toggle_play_pause(&mut self) {
+        match self.state() {
+            PlayerState::Playing => self.pause(),
+            PlayerState::Paused | PlayerState::Stopped => self.start(),
+            _ => {}
+        }
+    }
+
+    /// Handle key input
+    fn handle_keys(&mut self, ui: &mut Ui) {
+        const SEEK_STEP: f32 = 5.0;
+        const VOLUME_STEP: f32 = 0.1;
+
+        ui.input(|inputs| {
+            for e in &inputs.events {
+                match e {
+                    Event::Key { key, pressed, .. } if *pressed => match key {
+                        Key::Space => {
+                            self.toggle_play_pause();
+                        }
+                        Key::OpenBracket => {
+                            self.playback_speed.fetch_sub(1, Ordering::Relaxed);
+                        }
+                        Key::CloseBracket => {
+                            self.playback_speed.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Key::ArrowRight => {
+                            self.seek(self.elapsed() + SEEK_STEP);
+                        }
+                        Key::ArrowLeft => {
+                            self.seek(self.elapsed() - SEEK_STEP);
+                        }
+                        Key::ArrowUp => {
+                            self.set_volume_f32(self.volume_f32() + VOLUME_STEP);
+                        }
+                        Key::ArrowDown => {
+                            self.set_volume_f32(self.volume_f32() - VOLUME_STEP);
+                        }
+                        Key::F => {
+                            self.fullscreen = !self.fullscreen;
+                            self.ctx.send_viewport_cmd_to(
+                                ViewportId::ROOT,
+                                ViewportCommand::Fullscreen(self.fullscreen),
+                            );
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        });
     }
 
     fn process_state(&mut self, size: Vec2) {
@@ -672,6 +729,7 @@ impl<T> CustomPlayer<T> {
             last_frame_counter: 0,
             error: None,
             maintain_aspect: true,
+            fullscreen: false,
         }
     }
 }
@@ -679,7 +737,7 @@ impl<T> CustomPlayer<T> {
 impl<T> PlayerControls for CustomPlayer<T> {
     /// The elapsed duration of the stream in seconds
     fn elapsed(&self) -> f32 {
-        self.frame_counter as f32 / self.framerate()
+        self.pts_to_sec(self.frame_pts) as f32
     }
 
     fn duration(&self) -> f32 {
@@ -809,6 +867,7 @@ where
     fn ui(self, ui: &mut Ui) -> Response {
         let size = ui.available_size();
 
+        self.handle_keys(ui);
         self.process_state(size);
         let frame_response = self.render_frame(ui);
         self.render_subtitles(ui);

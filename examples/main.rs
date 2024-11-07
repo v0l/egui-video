@@ -5,8 +5,7 @@ use egui_video::{AudioDevice, Player, PlayerControls};
 fn main() {
     env_logger::init();
     let mut opt = NativeOptions::default();
-    opt.viewport = ViewportBuilder::default()
-        .with_inner_size([1270.0, 740.0]);
+    opt.viewport = ViewportBuilder::default().with_inner_size([1270.0, 740.0]);
 
     let _ = eframe::run_native("app", opt, Box::new(|cc| Ok(Box::new(App::default()))));
 }

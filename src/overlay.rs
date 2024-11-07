@@ -3,30 +3,9 @@ use egui::{
     vec2, Align2, Color32, FontId, Rect, Response, Rounding, Sense, Shadow, Spinner, Ui, Vec2,
 };
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
+use ffmpeg_rs_raw::format_time;
 
-pub struct DefaultOverlay {}
-
-impl DefaultOverlay {
-    fn format_time(secs: f32) -> String {
-        const MIN: f32 = 60.0;
-        const HR: f32 = MIN * 60.0;
-
-        if secs >= HR {
-            format!(
-                "{:0>2.0}:{:0>2.0}:{:0>2.0}",
-                (secs / HR).floor(),
-                ((secs % HR) / MIN).floor(),
-                (secs % MIN).floor()
-            )
-        } else {
-            format!(
-                "{:0>2.0}:{:0>2.0}",
-                (secs / MIN).floor(),
-                (secs % MIN).floor()
-            )
-        }
-    }
-}
+pub struct DefaultOverlay;
 
 impl PlayerOverlay for DefaultOverlay {
     fn show(&self, ui: &mut Ui, frame_response: &Response, p: &mut PlayerOverlayState) {
@@ -50,7 +29,7 @@ impl PlayerOverlay for DefaultOverlay {
 
         let seekbar_width = fullseekbar_width
             * if p.duration() != 0.0 {
-                p.elapsed() / p.duration()
+                (p.elapsed() / p.duration()).max(1.0)
             } else {
                 0.0
             };
@@ -210,11 +189,11 @@ impl PlayerOverlay for DefaultOverlay {
                 if p.duration() > 0.0 {
                     format!(
                         "{} / {}",
-                        Self::format_time(p.elapsed()),
-                        Self::format_time(p.duration())
+                        format_time(p.elapsed()),
+                        format_time(p.duration())
                     )
                 } else {
-                    Self::format_time(p.elapsed())
+                    format_time(p.elapsed())
                 },
                 duration_text_font_id,
                 text_color,
