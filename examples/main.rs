@@ -1,13 +1,14 @@
 use eframe::NativeOptions;
-use egui::{vec2, CentralPanel, TextEdit, Widget};
+use egui::{CentralPanel, TextEdit, ViewportBuilder, Widget};
 use egui_video::{AudioDevice, Player, PlayerControls};
 
 fn main() {
     env_logger::init();
     let mut opt = NativeOptions::default();
-    opt.viewport.inner_size = Some(vec2(1280., 740.));
+    opt.viewport = ViewportBuilder::default()
+        .with_inner_size([1270.0, 740.0]);
 
-    let _ = eframe::run_native("app", opt, Box::new(|_| Ok(Box::new(App::default()))));
+    let _ = eframe::run_native("app", opt, Box::new(|cc| Ok(Box::new(App::default()))));
 }
 struct App {
     audio_device: AudioDevice,

@@ -110,6 +110,14 @@ impl PlayerControls for Player {
     fn set_playback_speed(&mut self, speed: f32) {
         self.inner.set_playback_speed(speed)
     }
+
+    fn maintain_aspect(&self) -> bool {
+        self.inner.maintain_aspect()
+    }
+
+    fn set_maintain_aspect(&mut self, maintain_aspect: bool) {
+        self.inner.set_maintain_aspect(maintain_aspect)
+    }
 }
 
 impl Widget for &mut Player {

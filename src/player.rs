@@ -8,8 +8,8 @@ use cpal::SampleFormat;
 use egui::load::SizedTexture;
 use egui::text::LayoutJob;
 use egui::{
-    pos2, vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Sense, TextFormat,
-    TextureHandle, TextureOptions, Ui, Vec2, Widget,
+    pos2, vec2, Align2, Color32, ColorImage, FontId, Image, Rect, Response, Sense, Stroke,
+    TextFormat, TextureHandle, TextureOptions, Ui, Vec2, Widget,
 };
 use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
@@ -40,6 +40,8 @@ enum PlayerMessage {
     SelectStream(AVMediaType, usize),
     /// Set playback speed
     SetPlaybackSpeed(f32),
+    /// Set video aspect to be the same as source content
+    SetMaintainAspect(bool),
 }
 
 /// The [`CustomPlayer`] processes and controls streams of video/audio.
@@ -67,6 +69,8 @@ pub struct CustomPlayer<T> {
     frame_start: Instant,
     /// How many frames have been rendered so far
     frame_counter: u64,
+    /// Maintain video aspect ratio
+    maintain_aspect: bool,
 
     /// Stream info
     info: Option<DemuxerInfo>,
@@ -118,6 +122,8 @@ pub trait PlayerControls {
     fn set_debug(&mut self, debug: bool);
     fn playback_speed(&self) -> f32;
     fn set_playback_speed(&mut self, speed: f32);
+    fn maintain_aspect(&self) -> bool;
+    fn set_maintain_aspect(&mut self, maintain_aspect: bool);
 }
 
 /// Wrapper to store player info and pass to overlay impl
@@ -131,6 +137,7 @@ pub struct PlayerOverlayState {
     looping: bool,
     debug: bool,
     state: PlayerState,
+    maintain_aspect: bool,
     inbox: UiInboxSender<PlayerMessage>,
 }
 
@@ -218,6 +225,16 @@ impl PlayerControls for PlayerOverlayState {
     fn set_playback_speed(&mut self, speed: f32) {
         self.inbox
             .send(PlayerMessage::SetPlaybackSpeed(speed))
+            .unwrap()
+    }
+
+    fn maintain_aspect(&self) -> bool {
+        self.maintain_aspect
+    }
+
+    fn set_maintain_aspect(&mut self, maintain_aspect: bool) {
+        self.inbox
+            .send(PlayerMessage::SetMaintainAspect(maintain_aspect))
             .unwrap()
     }
 }
@@ -374,6 +391,7 @@ impl<T> CustomPlayer<T> {
             PlayerMessage::SetPlaybackSpeed(s) => {
                 self.set_playback_speed(s);
             }
+            PlayerMessage::SetMaintainAspect(a) => self.set_maintain_aspect(a),
         }
     }
 
@@ -385,8 +403,34 @@ impl<T> CustomPlayer<T> {
         self.render_frame_at(ui, ui.available_rect_before_wrap())
     }
 
+    /// Exact size of the video frame inside a given [Rect]
+    fn video_frame_size(&self, rect: Rect) -> Vec2 {
+        if self.maintain_aspect {
+            let bv = self.info.as_ref().and_then(|i| i.best_video());
+            let video_size = bv
+                .map(|v| vec2(v.width as f32, v.height as f32))
+                .unwrap_or(rect.size());
+            let ratio = video_size.x / video_size.y;
+            let rect_ratio = rect.width() / rect.height();
+            if ratio > rect_ratio {
+                let h = rect.width() / ratio;
+                vec2(rect.width().floor(), h.floor())
+            } else if ratio < rect_ratio {
+                let w = rect.height() * ratio;
+                vec2(w.floor(), rect.height().floor())
+            } else {
+                rect.size()
+            }
+        } else {
+            rect.size()
+        }
+    }
+
     fn render_frame_at(&self, ui: &mut Ui, rect: Rect) -> Response {
-        ui.put(rect, self.generate_frame_image(rect.size()))
+        let video_size = self.video_frame_size(rect);
+        ui.painter()
+            .rect(rect, 0.0, Color32::BLACK, Stroke::default());
+        ui.put(rect, self.generate_frame_image(video_size))
     }
 
     fn render_subtitles(&mut self, ui: &mut Ui) {
@@ -406,7 +450,7 @@ impl<T> CustomPlayer<T> {
 
         const PADDING: f32 = 5.0;
         let vec_padding = vec2(PADDING, PADDING);
-        let job = self.debug_inner();
+        let job = self.debug_inner(frame_response.rect);
         let galley = painter.layout_job(job);
         let mut bg_pos = galley
             .rect
@@ -425,7 +469,7 @@ impl<T> CustomPlayer<T> {
         Duration::from_secs_f64(self.pts_to_sec(pts))
     }
 
-    fn debug_inner(&mut self) -> LayoutJob {
+    fn debug_inner(&mut self, frame_response: Rect) -> LayoutJob {
         let v_pts = self.elapsed();
         let a_pts = self
             .audio
@@ -448,12 +492,15 @@ impl<T> CustomPlayer<T> {
             font.clone(),
         );
 
+        let video_size = self.video_frame_size(frame_response);
         layout.append(
             &format!(
-                "\nplayback: {:.2} fps ({:.2}x), volume={:.0}%",
+                "\nplayback: {:.2} fps ({:.2}x), volume={:.0}%, resolution={}x{}",
                 self.avg_fps,
                 self.avg_fps / self.framerate(),
-                100.0 * self.volume_f32()
+                100.0 * self.volume_f32(),
+                video_size.x,
+                video_size.y
             ),
             0.0,
             font.clone(),
@@ -624,6 +671,7 @@ impl<T> CustomPlayer<T> {
             frame_counter: 0,
             last_frame_counter: 0,
             error: None,
+            maintain_aspect: true,
         }
     }
 }
@@ -744,6 +792,14 @@ impl<T> PlayerControls for CustomPlayer<T> {
         self.playback_speed
             .store((u8::MAX as f32 * speed) as u8, Ordering::Relaxed);
     }
+
+    fn maintain_aspect(&self) -> bool {
+        self.maintain_aspect
+    }
+
+    fn set_maintain_aspect(&mut self, maintain_aspect: bool) {
+        self.maintain_aspect = maintain_aspect;
+    }
 }
 
 impl<T> Widget for &mut CustomPlayer<T>
@@ -789,6 +845,7 @@ where
             looping: self.looping,
             debug: self.debug,
             state: self.state(),
+            maintain_aspect: self.maintain_aspect,
             inbox: inbox.sender(),
         };
         self.overlay.show(ui, frame, &mut state);
