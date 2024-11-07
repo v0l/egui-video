@@ -14,8 +14,6 @@ struct App {
     player: Option<Player>,
 
     media_path: String,
-    stream_size_scale: f32,
-    seek_frac: f32,
 }
 
 impl Default for App {
@@ -23,8 +21,6 @@ impl Default for App {
         Self {
             audio_device: AudioDevice::new().unwrap(),
             media_path: "https://test-streams.mux.dev/tos_ismc/main.m3u8".to_string(),
-            stream_size_scale: 1.,
-            seek_frac: 0.,
             player: None,
         }
     }

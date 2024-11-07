@@ -16,7 +16,7 @@ use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
 use ffmpeg_rs_raw::DemuxerInfo;
 use log::trace;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -417,7 +417,8 @@ impl<T> CustomPlayer<T> {
     }
 
     fn pts_to_sec(&self, pts: i64) -> f64 {
-        (pts as f64 / self.media_player.tbn.den as f64) * self.media_player.tbn.num as f64
+        let tbn = self.media_player.tbn();
+        (pts as f64 / tbn.den as f64) * tbn.num as f64
     }
 
     fn pts_to_duration(&self, pts: i64) -> Duration {

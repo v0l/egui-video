@@ -1,6 +1,6 @@
 use crate::ffmpeg_sys_the_third::{
     av_frame_free, av_frame_unref, av_packet_free, av_rescale_q, av_sample_fmt_is_planar, AVFrame,
-    AVMediaType, AVPixelFormat, AVRational, AVSampleFormat, AVStream,
+    AVMediaType, AVPixelFormat, AVSampleFormat, AVStream, AV_NOPTS_VALUE,
 };
 #[cfg(feature = "hls")]
 use crate::hls::DemuxerIsh;
@@ -9,12 +9,17 @@ use crate::hls::HlsStream;
 
 use anyhow::Error;
 use egui::{Color32, ColorImage, Vec2};
+use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVRational;
 use ffmpeg_rs_raw::{get_frame_from_hw, Decoder, Demuxer, DemuxerInfo, Resample, Scaler};
+use log::{error, warn};
 use std::collections::BinaryHeap;
+use std::fmt::{Display, Formatter};
 use std::mem::transmute;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicU32, AtomicU8, Ordering,
+};
 use std::sync::mpsc::Sender;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 use std::{ptr, slice};
@@ -125,33 +130,61 @@ impl PartialOrd for DecoderMessage {
     }
 }
 
+#[derive(Clone)]
+struct MediaPlayerState {
+    pub width: Arc<AtomicU16>,
+    pub height: Arc<AtomicU16>,
+    pub sample_rate: Arc<AtomicU32>,
+    pub channels: Arc<AtomicU8>,
+    pub pts_max: Arc<AtomicI64>,
+    pub pts_min: Arc<AtomicI64>,
+    pub running: Arc<AtomicBool>,
+    pub buffer_size: Arc<AtomicI32>,
+    pub media_queue: Arc<Mutex<BinaryHeap<DecoderMessage>>>,
+    pub audio_chan: Option<Sender<DecoderMessage>>,
+    pub tbn_num: Arc<AtomicI32>,
+    pub tbn_den: Arc<AtomicI32>,
+}
+
+impl Default for MediaPlayerState {
+    fn default() -> Self {
+        const DEFAULT_TBN: i32 = 90_000;
+
+        Self {
+            width: Arc::new(Default::default()),
+            height: Arc::new(Default::default()),
+            sample_rate: Arc::new(Default::default()),
+            channels: Arc::new(Default::default()),
+            pts_max: Arc::new(Default::default()),
+            pts_min: Arc::new(Default::default()),
+            running: Arc::new(AtomicBool::new(true)),
+            buffer_size: Arc::new(AtomicI32::new(DEFAULT_TBN)),
+            media_queue: Arc::new(Mutex::new(Default::default())),
+            audio_chan: None,
+            tbn_num: Arc::new(AtomicI32::new(1)),
+            tbn_den: Arc::new(AtomicI32::new(DEFAULT_TBN)),
+        }
+    }
+}
+
+impl MediaPlayerState {
+    pub fn tbn(&self) -> AVRational {
+        AVRational {
+            num: self.tbn_num.load(Ordering::Relaxed),
+            den: self.tbn_den.load(Ordering::Relaxed),
+        }
+    }
+}
+
 pub struct MediaPlayer {
     input: String,
     thread: Option<JoinHandle<()>>,
-
-    target_size: Arc<RwLock<[u16; 2]>>,
-    target_sample_rate: Arc<AtomicU32>,
-    target_channels: Arc<AtomicU8>,
-    pts_max: Arc<AtomicI64>,
-    pts_min: Arc<AtomicI64>,
-    running: Arc<AtomicBool>,
-
-    /// Number of timebase units of frames to store in [media_queue] (using [pts_max]/[pts_in])
-    target_buffer_size: Arc<AtomicU32>,
-
-    /// Queue of frames/subtitles/audio samples
-    media_queue: Arc<Mutex<BinaryHeap<DecoderMessage>>>,
-
-    /// Audio channel to bypass [media_queue]
-    /// Audio needs more buffering than video frames
-    audio_chan: Option<Sender<DecoderMessage>>,
-
-    pub tbn: AVRational,
+    state: MediaPlayerState,
 }
 
 impl Drop for MediaPlayer {
     fn drop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
+        self.state.running.store(false, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             thread.join().expect("join failed");
         }
@@ -160,58 +193,52 @@ impl Drop for MediaPlayer {
 
 impl MediaPlayer {
     pub fn new(input: &str) -> Self {
-        /// 90k is a very common timebase den because its divided well into various common
-        /// fps' and audio sample rates
-        const DEFAULT_TBN: i32 = 90_000;
-
         Self {
             input: input.to_string(),
             thread: None,
-            target_size: Arc::new(RwLock::new([0, 0])),
-            target_sample_rate: Arc::new(Default::default()),
-            target_channels: Arc::new(AtomicU8::new(2)),
-            pts_max: Arc::new(AtomicI64::new(0)),
-            pts_min: Arc::new(AtomicI64::new(0)),
-            running: Arc::new(AtomicBool::new(true)),
-            media_queue: Arc::new(Mutex::new(BinaryHeap::new())),
-            audio_chan: None,
-            tbn: AVRational {
-                num: 1,
-                den: DEFAULT_TBN,
-            },
-            target_buffer_size: Arc::new(AtomicU32::new(DEFAULT_TBN as u32 * 2)),
+            state: MediaPlayerState::default(),
         }
     }
 
+    pub fn tbn(&self) -> AVRational {
+        self.state.tbn()
+    }
+
     pub fn with_audio_chan(mut self, chan: Sender<DecoderMessage>) -> Self {
-        self.audio_chan = Some(chan);
+        self.state.audio_chan = Some(chan);
         self
     }
 
     /// Get the size of the buffer as AV_TIMEBASE units
     pub fn buffer_size(&self) -> i64 {
-        let max = self.pts_max.load(Ordering::Relaxed);
-        let min = self.pts_min.load(Ordering::Relaxed);
+        let max = self.state.pts_max.load(Ordering::Relaxed);
+        let min = self.state.pts_min.load(Ordering::Relaxed);
         max - min
     }
 
     /// Get the number of messages in the queue
     pub fn buffer_len(&self) -> usize {
-        self.media_queue.lock().map(|q| q.len()).unwrap_or(0)
+        self.state.media_queue.lock().map(|q| q.len()).unwrap_or(0)
     }
 
     /// Set the video target size in pixels
     pub fn set_target_size(&mut self, size: Vec2) {
-        if let Ok(mut s) = self.target_size.write() {
-            s[0] = size.x as u16;
-            s[1] = size.y as u16;
-        }
+        self.state.width.store(size.x as u16, Ordering::Relaxed);
+        self.state.height.store(size.y as u16, Ordering::Relaxed);
     }
 
     /// Set the audio sample rate, all samples are stereo f32
     pub fn set_target_sample_rate(&mut self, sample_rate: u32) {
-        self.target_sample_rate
-            .store(sample_rate, Ordering::Relaxed);
+        self.state.sample_rate.store(sample_rate, Ordering::Relaxed);
+    }
+
+    fn store_min_pts(&self, r: Option<&DecoderMessage>) {
+        if let Some(m) = r.as_ref() {
+            let pts = m.pts();
+            if pts != 0 {
+                self.state.pts_min.store(pts, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Pop the next message from the player in PTS order
@@ -219,7 +246,7 @@ impl MediaPlayer {
     /// You must read from this endpoint at the correct rate to match the video rate.
     /// Internally the buffer will build up to [target_buffer_size]
     pub fn next(&mut self) -> Option<DecoderMessage> {
-        if let Ok(mut q) = self.media_queue.lock() {
+        if let Ok(mut q) = self.state.media_queue.lock() {
             let r = q.pop();
             self.store_min_pts(r.as_ref());
             r
@@ -228,21 +255,12 @@ impl MediaPlayer {
         }
     }
 
-    fn store_min_pts(&self, r: Option<&DecoderMessage>) {
-        if let Some(m) = r.as_ref() {
-            let pts = m.pts();
-            if pts != 0 {
-                self.pts_min.store(pts, Ordering::Relaxed);
-            }
-        }
-    }
-
     /// Pop the next message if [f_check] is true
     pub fn next_if<F>(&mut self, mut f_check: F) -> Option<DecoderMessage>
     where
         F: FnMut(&DecoderMessage) -> bool,
     {
-        if let Ok(mut q) = self.media_queue.lock() {
+        if let Ok(mut q) = self.state.media_queue.lock() {
             if let Some(r) = q.peek() {
                 if f_check(r) {
                     let r = q.pop();
@@ -255,7 +273,7 @@ impl MediaPlayer {
     }
 
     pub fn stop(&mut self) {
-        self.running.store(false, Ordering::Relaxed);
+        self.state.running.store(false, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
             thread.join().expect("join failed");
         }
@@ -266,6 +284,66 @@ impl MediaPlayer {
             !t.is_finished()
         } else {
             false
+        }
+    }
+
+    pub fn start(&mut self) -> bool {
+        if let Some(t) = &self.thread {
+            if t.is_finished() {
+                self.thread.take();
+            } else {
+                return false;
+            }
+        }
+        let state = self.state.clone();
+        let input = self.input.clone();
+        let q_err = self.state.media_queue.clone();
+        self.thread = Some(std::thread::spawn(move || {
+            let media_thread = MediaPlayerThread::new(&input, state);
+            if let Err(e) = unsafe { media_thread.run() } {
+                error!("{}", e);
+                if let Ok(mut q) = q_err.lock() {
+                    q.push(DecoderMessage::Error(e.to_string()));
+                }
+            }
+        }));
+        true
+    }
+}
+
+struct MediaPlayerThread {
+    state: MediaPlayerState,
+    #[cfg(feature = "hls")]
+    demuxer: Box<dyn DemuxerIsh>,
+    #[cfg(not(feature = "hls"))]
+    demuxer: Demuxer,
+    decoder: Decoder,
+    scale: Scaler,
+    resample: Resample,
+    media_info: Option<DemuxerInfo>,
+}
+
+impl Display for MediaPlayerThread {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        if let Some(info) = &self.media_info {
+            if let Some(v) = info.best_video() {
+                
+            }
+        }
+        Ok(())
+    }
+}
+
+impl MediaPlayerThread {
+    pub fn new(input: &str, state: MediaPlayerState) -> MediaPlayerThread {
+        let sr = state.sample_rate.load(Ordering::Relaxed);
+        Self {
+            state,
+            demuxer: Self::open_demuxer(input),
+            decoder: Decoder::new(),
+            scale: Scaler::new(),
+            resample: Resample::new(AVSampleFormat::AV_SAMPLE_FMT_FLT, sr, 2),
+            media_info: None,
         }
     }
 
@@ -283,171 +361,123 @@ impl MediaPlayer {
         Demuxer::new(input)
     }
 
-    pub fn start(&mut self) -> bool {
-        if let Some(t) = &self.thread {
-            if t.is_finished() {
-                self.thread.take();
-            } else {
-                return false;
+    unsafe fn run(mut self) -> Result<(), Error> {
+        self.state.pts_min.store(0, Ordering::Relaxed);
+        self.state.pts_max.store(0, Ordering::Relaxed);
+        self.state.running.store(true, Ordering::Relaxed);
+
+        loop {
+            if !self.state.running.load(Ordering::Relaxed) {
+                break;
             }
-        }
-        let input = self.input.clone();
-        let tx = self.media_queue.clone();
-        let target_size = self.target_size.clone();
-        let max_pts = self.pts_max.clone();
-        let min_pts = self.pts_min.clone();
-        let choke_point = self.target_buffer_size.clone();
-        let tbn = self.tbn;
-        let running = self.running.clone();
-        let audio_sample_rate = self.target_sample_rate.clone();
-        let audio_tx = self.audio_chan.clone();
-        running.store(true, Ordering::Relaxed);
-        max_pts.store(0, Ordering::Relaxed);
-        min_pts.store(0, Ordering::Relaxed);
 
-        self.thread = Some(std::thread::spawn(move || {
-            let mut probed: Option<DemuxerInfo> = None;
-            let mut demux = Self::open_demuxer(&input);
-            let mut decode = Decoder::new();
-            let mut scale: Option<Scaler> = None;
-            let mut resample: Option<Resample> = None;
-
-            decode.enable_hw_decoder_any();
-            unsafe {
-                loop {
-                    if !running.load(Ordering::Relaxed) {
+            // wait until probe result
+            if self.media_info.as_ref().is_none() {
+                match self.demuxer.probe_input() {
+                    Ok(p) => {
+                        self.media_info = Some(p.clone());
+                        for c in &p.channels {
+                            self.decoder.setup_decoder(c, None)?;
+                        }
+                        let mut q = self
+                            .state
+                            .media_queue
+                            .lock()
+                            .map_err(|e| Error::msg(e.to_string()))?;
+                        q.push(DecoderMessage::MediaInfo(p));
+                    }
+                    Err(e) => {
+                        let mut q = self
+                            .state
+                            .media_queue
+                            .lock()
+                            .map_err(|e| Error::msg(e.to_string()))?;
+                        q.push(DecoderMessage::Error(e.to_string()));
                         break;
                     }
-                    // wait until probe result
-                    if probed.as_ref().is_none() {
-                        match demux.probe_input() {
-                            Ok(p) => {
-                                probed = Some(p.clone());
-                                for c in &p.channels {
-                                    decode
-                                        .setup_decoder(c, None)
-                                        .expect("Failed to setup decoder");
-                                }
-                                eprintln!("{}", decode);
-                                if let Ok(mut q) = tx.lock() {
-                                    q.push(DecoderMessage::MediaInfo(p));
-                                }
-                            }
-                            Err(e) => {
-                                if let Ok(mut q) = tx.lock() {
-                                    q.push(DecoderMessage::Error(e.to_string()));
-                                }
-                                break;
-                            }
-                        }
-                    }
-
-                    if scale.is_none() {
-                        scale = Some(Scaler::new())
-                    }
-                    if resample.is_none() {
-                        let sr = audio_sample_rate.load(Ordering::Relaxed);
-                        resample = Some(Resample::new(AVSampleFormat::AV_SAMPLE_FMT_FLT, sr, 2))
-                    }
-
-                    // unwrap
-                    let probed = probed.as_ref().unwrap();
-                    let scale = scale.as_mut().unwrap();
-                    let resample = resample.as_mut().unwrap();
-
-                    let buf_size =
-                        max_pts.load(Ordering::Relaxed) - min_pts.load(Ordering::Relaxed);
-                    if buf_size > choke_point.load(Ordering::Relaxed) as i64 {
-                        std::thread::sleep(Duration::from_millis(10));
-                        continue;
-                    }
-
-                    // read frames
-                    let (mut pkt, stream) = demux.get_packet().expect("failed to get packet");
-                    if !stream.is_null() && !pkt.is_null() && !probed.is_best_stream(stream) {
-                        av_packet_free(&mut pkt);
-                        continue;
-                    }
-
-                    if let Ok(frames) = decode.decode_pkt(pkt, stream) {
-                        let size = target_size.read().expect("failed to read size");
-                        for (frame, stream) in frames {
-                            match Self::process_frame(
-                                &tx,
-                                &tbn,
-                                frame,
-                                stream,
-                                scale,
-                                resample,
-                                size[0],
-                                size[1],
-                                audio_tx.clone(),
-                            ) {
-                                Err(e) => panic!("{}", e),
-                                Ok(mut frame) => {
-                                    let f_pts = av_rescale_q(
-                                        (*frame).pts - (*stream).start_time,
-                                        (*stream).time_base,
-                                        tbn,
-                                    );
-                                    let _ = max_pts.fetch_update(
-                                        Ordering::SeqCst,
-                                        Ordering::SeqCst,
-                                        |v| {
-                                            if f_pts > v {
-                                                Some(f_pts)
-                                            } else {
-                                                None
-                                            }
-                                        },
-                                    );
-
-                                    av_frame_free(&mut frame);
-                                }
-                            }
-                        }
-                    }
-
-                    if pkt.is_null() {
-                        break;
-                    }
-                    av_packet_free(&mut pkt);
                 }
             }
-            running.store(false, Ordering::Relaxed);
-        }));
-        true
+
+            // unwrap
+            let probed = self.media_info.as_ref().unwrap();
+
+            // check if buffer is full
+            let buf_size = self.state.pts_max.load(Ordering::Relaxed)
+                - self.state.pts_min.load(Ordering::Relaxed);
+            if buf_size > self.state.buffer_size.load(Ordering::Relaxed) as i64 {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+
+            // read frames
+            let (mut pkt, stream) = self.demuxer.get_packet()?;
+            if !stream.is_null() && !pkt.is_null() && !probed.is_best_stream(stream) {
+                av_packet_free(&mut pkt);
+                continue;
+            }
+
+            let tbn = self.state.tbn();
+            match self.decoder.decode_pkt(pkt, stream) {
+                Ok(frames) => {
+                    for (frame, stream) in frames {
+                        let mut frame = self.process_frame(frame, stream, tbn)?;
+                        av_frame_free(&mut frame);
+                    }
+                }
+                Err(e) => warn!("failed to decode packet: {}", e),
+            }
+
+            if pkt.is_null() {
+                break;
+            }
+            av_packet_free(&mut pkt);
+        }
+        self.state.running.store(false, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Send decoded frames to player
     unsafe fn process_frame(
-        tx: &Arc<Mutex<BinaryHeap<DecoderMessage>>>,
-        tbn: &AVRational,
+        &mut self,
         frame: *mut AVFrame,
         stream: *mut AVStream,
-        scale: &mut Scaler,
-        resample: &mut Resample,
-        width: u16,
-        height: u16,
-        audio_chan: Option<Sender<DecoderMessage>>,
+        tbn: AVRational,
     ) -> Result<*mut AVFrame, Error> {
         let frame = get_frame_from_hw(frame)?;
-        let pts = av_rescale_q(
-            (*frame).pts - (*stream).start_time,
-            (*stream).time_base,
-            *tbn,
-        );
-        let duration = av_rescale_q((*frame).duration, (*stream).time_base, *tbn);
+        let stream_start = if (*stream).start_time == AV_NOPTS_VALUE {
+            0
+        } else {
+            (*stream).start_time
+        };
+        let pts = av_rescale_q((*frame).pts - stream_start, (*stream).time_base, tbn);
+        let duration = av_rescale_q((*frame).duration, (*stream).time_base, tbn);
         let media_type = (*(*stream).codecpar).codec_type;
 
         if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO {
+            let width = self.state.width.load(Ordering::Relaxed);
+            let height = self.state.height.load(Ordering::Relaxed);
             let frame =
-                scale.process_frame(frame, width, height, AVPixelFormat::AV_PIX_FMT_RGBA)?;
+                self.scale
+                    .process_frame(frame, width, height, AVPixelFormat::AV_PIX_FMT_RGBA)?;
             let image = video_frame_to_image(frame);
-            let mut q = tx.lock().expect("failed to lock tx");
+            let mut q = self
+                .state
+                .media_queue
+                .lock()
+                .map_err(|e| Error::msg(e.to_string()))?;
             q.push(DecoderMessage::VideoFrame(pts, duration, image));
+            let _ = self
+                .state
+                .pts_max
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    if pts > v {
+                        Some(pts)
+                    } else {
+                        None
+                    }
+                });
         } else if media_type == AVMediaType::AVMEDIA_TYPE_AUDIO {
-            let mut frame = resample.process_frame(frame)?;
+            let mut frame = self.resample.process_frame(frame)?;
             let is_planar = av_sample_fmt_is_planar(transmute((*frame).format)) == 1;
             let plane_mul = if is_planar {
                 1
@@ -458,17 +488,25 @@ impl MediaPlayer {
 
             let samples = slice::from_raw_parts((*frame).data[0] as *const f32, size);
             let msg = DecoderMessage::AudioSamples(pts, duration, samples.to_vec());
-            if let Some(atx) = audio_chan {
+            if let Some(atx) = self.state.audio_chan.as_ref() {
                 atx.send(msg)?;
             } else {
-                let mut q = tx.lock().expect("failed to lock tx");
+                let mut q = self
+                    .state
+                    .media_queue
+                    .lock()
+                    .map_err(|e| Error::msg(e.to_string()))?;
                 q.push(msg);
             }
             av_frame_free(&mut frame);
         } else if media_type == AVMediaType::AVMEDIA_TYPE_SUBTITLE {
             let str: &[u8] = slice::from_raw_parts((*frame).data[0], (*frame).linesize[0] as usize);
             let str = String::from_utf8_lossy(str).to_string();
-            let mut q = tx.lock().expect("failed to lock tx");
+            let mut q = self
+                .state
+                .media_queue
+                .lock()
+                .map_err(|e| Error::msg(e.to_string()))?;
             q.push(DecoderMessage::Subtitles(pts, duration, str));
         }
         Ok(frame)
