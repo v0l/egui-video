@@ -12,6 +12,7 @@ mod hls;
 pub mod media_player;
 mod overlay;
 mod player;
+#[cfg(feature = "subtitles")]
 mod subtitle;
 
 use crate::overlay::DefaultOverlay;

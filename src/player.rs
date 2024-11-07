@@ -1,6 +1,6 @@
-#[allow(integer_atomics)]
 use crate::audio::{AudioBuffer, PlayerAudioStream};
-use crate::media_player::{DecoderMessage, MediaPlayer};
+use crate::media_player::{MediaPlayer, MediaPlayerData};
+#[cfg(feature = "subtitles")]
 use crate::subtitle::Subtitle;
 use crate::AudioDevice;
 use cpal::traits::DeviceTrait;
@@ -13,12 +13,15 @@ use egui::{
 };
 use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
-use ffmpeg_rs_raw::DemuxerInfo;
-use log::trace;
+use ffmpeg_rs_raw::{format_time, DemuxerInfo};
+use log::{trace, warn};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Receiver;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(not(feature = "subtitles"))]
+struct Subtitle;
 
 #[derive(Debug)]
 /// IPC for player
@@ -291,11 +294,9 @@ impl<T> CustomPlayer<T> {
             return;
         }
 
-        // reset avg fps timer every 0.5s
-        if self.frame_counter != 0
-            && self.frame_counter % (self.framerate() / 2.0).max(1.0) as u64 == 0
-        {
-            let n_frames = self.frame_counter - self.last_frame_counter;
+        // reset avg fps every 1s
+        let n_frames = self.frame_counter - self.last_frame_counter;
+        if n_frames >= self.framerate() as u64 {
             self.avg_fps = n_frames as f32 / (Instant::now() - self.avg_fps_start).as_secs_f32();
             self.avg_fps_start = Instant::now();
             self.last_frame_counter = self.frame_counter;
@@ -303,10 +304,10 @@ impl<T> CustomPlayer<T> {
 
         while let Some(msg) = self.media_player.next() {
             match msg {
-                DecoderMessage::MediaInfo(i) => {
+                MediaPlayerData::MediaInfo(i) => {
                     self.info = Some(i);
                 }
-                DecoderMessage::VideoFrame(pts, duration, f) => {
+                MediaPlayerData::VideoFrame(pts, duration, f) => {
                     self.load_frame(f, pts, duration);
 
                     let v_pts = self.pts_to_sec(self.frame_pts);
@@ -321,17 +322,20 @@ impl<T> CustomPlayer<T> {
                     self.request_repaint_for_next_frame();
                     break;
                 }
-                DecoderMessage::AudioSamples(pts, duration, s) => {
+                MediaPlayerData::AudioSamples(pts, duration, s) => {
                     if let Some(a) = self.audio.as_mut() {
                         if let Ok(mut q) = a.buffer.lock() {
                             q.add_samples(s);
                         }
                     }
                 }
-                DecoderMessage::Subtitles(pts, duration, text) => {
-                    self.subtitle = Some(Subtitle::from_text(&text));
+                MediaPlayerData::Subtitles(pts, duration, text, codec) => {
+                    #[cfg(feature = "subtitles")]
+                    {
+                        self.subtitle = Some(Subtitle::new(text, pts, duration, codec));
+                    }
                 }
-                DecoderMessage::Error(e) => {
+                MediaPlayerData::Error(e) => {
                     self.error = Some(e);
                     self.stop();
                 }
@@ -385,19 +389,15 @@ impl<T> CustomPlayer<T> {
         ui.put(rect, self.generate_frame_image(rect.size()))
     }
 
-    fn render_subtitles(&mut self, ui: &mut Ui, frame_response: &Response) {
+    fn render_subtitles(&mut self, ui: &mut Ui) {
+        #[cfg(feature = "subtitles")]
         if let Some(s) = self.subtitle.as_ref() {
-            ui.painter().text(
-                frame_response.rect.min
-                    + vec2(
-                        frame_response.rect.width() / 2.0,
-                        frame_response.rect.height() - 40.,
-                    ),
-                Align2::CENTER_BOTTOM,
-                &s.text,
-                FontId::proportional(16.),
-                Color32::WHITE,
-            );
+            let sub_end = s.pts + s.duration;
+            if sub_end < self.frame_pts {
+                self.subtitle.take();
+            } else {
+                ui.add(s);
+            }
         }
     }
 
@@ -435,12 +435,14 @@ impl<T> CustomPlayer<T> {
         let font = TextFormat::simple(FontId::monospace(11.), Color32::WHITE);
 
         let mut layout = LayoutJob::default();
+        let buffer = self.pts_to_sec(self.media_player.buffer_size());
         layout.append(
             &format!(
-                "sync: v:{:.3}s, a:{:.3}s, a-sync:{:.3}s",
+                "sync: v:{:.3}s, a:{:.3}s, a-sync:{:.3}s, buffer: {:.3}s",
                 v_pts,
                 a_pts,
-                a_pts - v_pts
+                a_pts - v_pts,
+                buffer
             ),
             0.0,
             font.clone(),
@@ -448,30 +450,43 @@ impl<T> CustomPlayer<T> {
 
         layout.append(
             &format!(
-                "\nplayback: {:.2} fps ({:.2}x)",
+                "\nplayback: {:.2} fps ({:.2}x), volume={:.0}%",
                 self.avg_fps,
-                self.avg_fps / self.framerate()
+                self.avg_fps / self.framerate(),
+                100.0 * self.volume_f32()
             ),
             0.0,
             font.clone(),
         );
 
-        let buffer = self.pts_to_sec(self.media_player.buffer_size());
-        layout.append(&format!("\nbuffer: {:.3}s", buffer), 0.0, font.clone());
+        if let Some(info) = self.info.as_ref() {
+            let bitrate_str = if info.bitrate > 1_000_000 {
+                format!("{:.1}M", info.bitrate as f32 / 1_000_000.0)
+            } else if info.bitrate > 1_000 {
+                format!("{:.1}k", info.bitrate as f32 / 1_000.0)
+            } else {
+                info.bitrate.to_string()
+            };
 
-        let bv = self.info.as_ref().and_then(|i| i.best_video());
-        if let Some(bv) = bv {
-            layout.append(&format!("\n{}", bv), 0.0, font.clone());
-        }
+            layout.append(
+                &format!(
+                    "\nduration: {}, bitrate: {}",
+                    format_time(info.duration),
+                    bitrate_str
+                ),
+                0.0,
+                font.clone(),
+            );
 
-        let ba = self.info.as_ref().and_then(|i| i.best_audio());
-        if let Some(ba) = ba {
-            layout.append(&format!("\n{}", ba), 0.0, font.clone());
-        }
-
-        let bs = self.info.as_ref().and_then(|i| i.best_subtitle());
-        if let Some(bs) = bs {
-            layout.append(&format!("\n{}", bs), 0.0, font.clone());
+            if let Some(bv) = info.best_video() {
+                layout.append(&format!("\n{}", bv), 0.0, font.clone());
+            }
+            if let Some(ba) = info.best_audio() {
+                layout.append(&format!("\n{}", ba), 0.0, font.clone());
+            }
+            if let Some(bs) = info.best_subtitle() {
+                layout.append(&format!("\n{}", bs), 0.0, font.clone());
+            }
         }
 
         layout
@@ -480,7 +495,7 @@ impl<T> CustomPlayer<T> {
     fn open_default_audio_stream(
         volume: Arc<AtomicU8>,
         state: Arc<AtomicU8>,
-        rx: Receiver<DecoderMessage>,
+        rx: Receiver<MediaPlayerData>,
     ) -> Option<PlayerAudioStream> {
         if let Ok(a) = AudioDevice::new() {
             if let Ok(cfg) = a.0.default_output_config() {
@@ -505,7 +520,7 @@ impl<T> CustomPlayer<T> {
                                 // take samples from channel
                                 while let Ok(m) = rx.try_recv() {
                                     match m {
-                                        DecoderMessage::AudioSamples(pts, duration, samples) => {
+                                        MediaPlayerData::AudioSamples(_, _, samples) => {
                                             buf.add_samples(samples)
                                         }
                                         _ => panic!("Unexpected message in audio channel"),
@@ -523,15 +538,15 @@ impl<T> CustomPlayer<T> {
                                 if buf.samples.len() < dst.len() {
                                     drop(buf);
                                     std::thread::sleep(Duration::from_millis(5));
-                                    trace!("Audio: buffer under-run!");
+                                    warn!("Audio: buffer underrun, playback is too slow!");
                                     continue;
                                 }
                                 // lazy audio sync
                                 let sync = buf.video_pos - buf.audio_pos;
-                                if sync > 0.05 {
+                                if sync > 0.1 {
                                     let drop_samples = buf.audio_delay_samples() as usize;
                                     buf.take_samples(drop_samples);
-                                    trace!("Audio: dropping {drop_samples} audio samples");
+                                    warn!("Audio: dropping {drop_samples} samples, playback is too fast!");
                                 }
                                 let v = volume.load(Ordering::Relaxed) as f32 / u8::MAX as f32;
                                 let w_len = dst.len().min(buf.samples.len());
@@ -574,7 +589,7 @@ impl<T> CustomPlayer<T> {
         let (tx, rx) = mpsc::channel();
         let audio = Self::open_default_audio_stream(vol.clone(), state.clone(), rx);
 
-        let mut media_player = MediaPlayer::new(input_path).with_audio_chan(tx);
+        let media_player = MediaPlayer::new(input_path).with_audio_chan(tx);
         if let Some(a) = &audio {
             media_player.set_target_sample_rate(a.config.sample_rate().0);
         }
@@ -684,8 +699,8 @@ impl<T> PlayerControls for CustomPlayer<T> {
     }
 
     /// Seek to a location in the stream.
-    fn seek(&mut self, seek_frac: f32) {
-        todo!()
+    fn seek(&mut self, pos: f32) {
+        self.media_player.seek_to(pos);
     }
 
     fn set_volume(&mut self, volume: u8) {
@@ -697,7 +712,7 @@ impl<T> PlayerControls for CustomPlayer<T> {
     }
 
     fn volume_f32(&self) -> f32 {
-        self.volume() as f32
+        self.volume() as f32 / u8::MAX as f32
     }
 
     fn set_volume_f32(&mut self, volume: f32) {
@@ -740,7 +755,7 @@ where
 
         self.process_state(size);
         let frame_response = self.render_frame(ui);
-        self.render_subtitles(ui, &frame_response);
+        self.render_subtitles(ui);
         self.render_overlay(ui, &frame_response);
         if let Some(error) = &self.error {
             ui.painter().text(

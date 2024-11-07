@@ -11,19 +11,20 @@ authors = ["n00kii"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [features]
-default = []
+default = ["subtitles"]
+subtitles = ["dep:nom"]
 hls = ["dep:m3u8-rs", "dep:ureq", "dep:url"]
 
 [dependencies]
 egui = "^0.29"
 anyhow = "^1.0.86"
 cpal = { version = "0.15.3", features = ["oboe-shared-stdcxx"] }
-ffmpeg-rs-raw = { git = "https://git.v0l.io/Kieran/ffmpeg-rs-raw.git", rev = "8b6166f1db18ffb322a5a634d6b6deaddb79ecbf" }
-nom = "7.1.3"
+ffmpeg-rs-raw = { git = "https://git.v0l.io/Kieran/ffmpeg-rs-raw.git", rev = "ff8b3df716afed3f1dd18b730b71c87ac13b8d2f" }
 atomic = "0.6.0"
 log = "0.4.22"
 egui_inbox = "^0.6.0"
 
+nom = { version = "7.1.3", optional = true }
 ureq = { version = "2.10.1", optional = true }
 m3u8-rs = { version = "6.0.0", optional = true }
 url = { version = "2.5.2", optional = true }
