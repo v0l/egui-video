@@ -84,11 +84,21 @@ unsafe fn map_frame_to_pixels(frame: *mut AVFrame) -> Vec<Color32> {
         .collect()
 }
 
+#[derive(Debug, Clone)]
+pub struct DecoderInfo {
+    /// Stream index
+    pub index: usize,
+    /// Which codec is being used for decoding
+    pub codec: String,
+}
+
 #[derive(Debug)]
 /// Messages received from the [MediaPlayer]
 pub enum MediaPlayerData {
     /// Stream information
     MediaInfo(DemuxerInfo),
+    /// Basic decoder info
+    DecoderInfo(DecoderInfo),
     /// A fatal error occurred during media playback
     Error(String),
     /// Video frame from the decoder
@@ -372,10 +382,13 @@ impl Display for MediaPlayerThread {
 impl MediaPlayerThread {
     pub fn new(input: &str, state: MediaPlayerState) -> MediaPlayerThread {
         let sr = state.sample_rate.load(Ordering::Relaxed);
+        let mut decoder = Decoder::new();
+        decoder.enable_hw_decoder_any();
+
         Self {
             state,
             demuxer: Self::open_demuxer(input),
-            decoder: Decoder::new(),
+            decoder,
             scale: Scaler::new(),
             resample: Resample::new(AVSampleFormat::AV_SAMPLE_FMT_FLT, sr, 2),
             media_info: None,
@@ -411,14 +424,18 @@ impl MediaPlayerThread {
                 match self.demuxer.probe_input() {
                     Ok(p) => {
                         self.media_info = Some(p.clone());
-                        for c in &p.channels {
-                            self.decoder.setup_decoder(c, None)?;
-                        }
                         let mut q = self
                             .state
                             .media_queue
                             .lock()
                             .map_err(|e| Error::msg(e.to_string()))?;
+                        for c in &p.channels {
+                            let ctx = self.decoder.setup_decoder(c, None)?;
+                            q.push(MediaPlayerData::DecoderInfo(DecoderInfo {
+                                index: c.index,
+                                codec: ctx.codec_name(),
+                            }));
+                        }
                         q.push(MediaPlayerData::MediaInfo(p));
                     }
                     Err(e) => {

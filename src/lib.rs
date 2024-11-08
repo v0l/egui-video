@@ -71,20 +71,12 @@ impl PlayerControls for Player {
         self.inner.seek(seek_frac)
     }
 
-    fn set_volume(&mut self, volume: u8) {
-        self.inner.set_volume(volume)
-    }
-
-    fn volume(&self) -> u8 {
+    fn volume(&self) -> f32 {
         self.inner.volume()
     }
 
-    fn volume_f32(&self) -> f32 {
-        self.inner.volume_f32()
-    }
-
-    fn set_volume_f32(&mut self, volume: f32) {
-        self.inner.set_volume_f32(volume)
+    fn set_volume(&mut self, volume: f32) {
+        self.inner.set_volume(volume)
     }
 
     fn looping(&self) -> bool {
@@ -117,6 +109,14 @@ impl PlayerControls for Player {
 
     fn set_maintain_aspect(&mut self, maintain_aspect: bool) {
         self.inner.set_maintain_aspect(maintain_aspect)
+    }
+
+    fn fullscreen(&self) -> bool {
+        self.inner.fullscreen()
+    }
+
+    fn set_fullscreen(&mut self, fullscreen: bool) {
+        self.inner.set_fullscreen(fullscreen)
     }
 }
 

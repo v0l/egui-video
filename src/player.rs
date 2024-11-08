@@ -1,5 +1,5 @@
 use crate::audio::{AudioBuffer, PlayerAudioStream};
-use crate::media_player::{MediaPlayer, MediaPlayerData};
+use crate::media_player::{DecoderInfo, MediaPlayer, MediaPlayerData};
 #[cfg(feature = "subtitles")]
 use crate::subtitle::Subtitle;
 use crate::AudioDevice;
@@ -14,9 +14,9 @@ use egui::{
 };
 use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
-use ffmpeg_rs_raw::{format_time, DemuxerInfo};
+use ffmpeg_rs_raw::{format_time, DemuxerInfo, StreamInfoChannel};
 use log::{trace, warn};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicI16, AtomicU16, AtomicU8, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,7 +32,7 @@ enum PlayerMessage {
     /// Seek to position in seconds
     Seek(f32),
     /// Set player volume
-    SetVolume(u8),
+    SetVolume(f32),
     /// Set player looping
     SetLooping(bool),
     /// Set debug overlay
@@ -43,17 +43,20 @@ enum PlayerMessage {
     SetPlaybackSpeed(f32),
     /// Set video aspect to be the same as source content
     SetMaintainAspect(bool),
+    /// Change fullscreen state
+    SetFullscreen(bool),
 }
 
 /// The [`CustomPlayer`] processes and controls streams of video/audio.
 /// This is what you use to show a video file.
 /// Initialize once, and use the [`CustomPlayer::ui`] or [`CustomPlayer::ui_at()`] functions to show the playback.
 pub struct CustomPlayer<T> {
-    state: Arc<AtomicU8>,
     overlay: T,
+
+    state: Arc<AtomicU8>,
     looping: bool,
-    volume: Arc<AtomicU8>,
-    playback_speed: Arc<AtomicU8>,
+    volume: Arc<AtomicU16>,
+    playback_speed: Arc<AtomicI16>,
     debug: bool,
 
     avg_fps: f32,
@@ -77,6 +80,7 @@ pub struct CustomPlayer<T> {
 
     /// Stream info
     info: Option<DemuxerInfo>,
+    decoders: Vec<DecoderInfo>,
 
     ctx: egui::Context,
     input_path: String,
@@ -88,6 +92,10 @@ pub struct CustomPlayer<T> {
 
     /// An error which prevented playback
     error: Option<String>,
+
+    /// Message to show on scree for a short time (usually from keyboard input)
+    osd: Option<String>,
+    osd_end: Instant,
 }
 
 /// The possible states of a [`CustomPlayer`].
@@ -105,28 +113,50 @@ pub enum PlayerState {
     Playing,
 }
 
+/// A media player controller
 pub trait PlayerControls {
+    /// Elapsed time in seconds
     fn elapsed(&self) -> f32;
+    /// Duration in seconds
     fn duration(&self) -> f32;
+    /// Framerate in frames per second
     fn framerate(&self) -> f32;
+    /// Video size in screen logical pixels
     fn size(&self) -> (u16, u16);
+    /// Player state (play / paused etc.)
     fn state(&self) -> PlayerState;
+    /// Pause playback
     fn pause(&mut self);
+    /// Start playback (or resume)
     fn start(&mut self);
+    /// Stop playback completely
     fn stop(&mut self);
-    fn seek(&mut self, seek_frac: f32);
-    fn set_volume(&mut self, volume: u8);
-    fn volume(&self) -> u8;
-    fn volume_f32(&self) -> f32;
-    fn set_volume_f32(&mut self, volume: f32);
+    /// Seek to a new location in the video as seconds
+    fn seek(&mut self, pos: f32);
+    /// Get the volume (0-1)
+    fn volume(&self) -> f32;
+    /// Set the volume (0-1)
+    fn set_volume(&mut self, volume: f32);
+    /// If the playback will loop after it ends
     fn looping(&self) -> bool;
+    /// Set playback looping
     fn set_looping(&mut self, looping: bool);
+    /// Is the debug overlay showing
     fn debug(&self) -> bool;
+    /// Set debug overlay visibility
     fn set_debug(&mut self, debug: bool);
+    /// Get the playback speed multiplier (1x = 1.0)
     fn playback_speed(&self) -> f32;
+    /// Set the playback speed (1x = 1.0)
     fn set_playback_speed(&mut self, speed: f32);
+    /// Is the aspect ratio maintained during scaling
     fn maintain_aspect(&self) -> bool;
+    /// Set if the aspect ratio should be maintained when scaling
     fn set_maintain_aspect(&mut self, maintain_aspect: bool);
+    /// If player is in fullscreen mode
+    fn fullscreen(&self) -> bool;
+    /// Set player is fullscreen or not
+    fn set_fullscreen(&mut self, fullscreen: bool);
 }
 
 /// Wrapper to store player info and pass to overlay impl
@@ -136,11 +166,12 @@ pub struct PlayerOverlayState {
     framerate: f32,
     playback_speed: f32,
     size: (u16, u16),
-    volume: u8,
+    volume: f32,
     looping: bool,
     debug: bool,
     state: PlayerState,
     maintain_aspect: bool,
+    fullscreen: bool,
     inbox: UiInboxSender<PlayerMessage>,
 }
 
@@ -187,22 +218,12 @@ impl PlayerControls for PlayerOverlayState {
         self.inbox.send(PlayerMessage::Seek(seek)).unwrap();
     }
 
-    fn set_volume(&mut self, volume: u8) {
+    fn volume(&self) -> f32 {
+        self.volume as f32 / u16::MAX as f32
+    }
+
+    fn set_volume(&mut self, volume: f32) {
         self.inbox.send(PlayerMessage::SetVolume(volume)).unwrap();
-    }
-
-    fn volume(&self) -> u8 {
-        self.volume
-    }
-
-    fn volume_f32(&self) -> f32 {
-        self.volume as f32 / u8::MAX as f32
-    }
-
-    fn set_volume_f32(&mut self, volume: f32) {
-        self.inbox
-            .send(PlayerMessage::SetVolume((u8::MAX as f32 * volume) as u8))
-            .unwrap();
     }
 
     fn looping(&self) -> bool {
@@ -240,8 +261,19 @@ impl PlayerControls for PlayerOverlayState {
             .send(PlayerMessage::SetMaintainAspect(maintain_aspect))
             .unwrap()
     }
+
+    fn fullscreen(&self) -> bool {
+        self.fullscreen
+    }
+
+    fn set_fullscreen(&mut self, fullscreen: bool) {
+        self.inbox
+            .send(PlayerMessage::SetFullscreen(fullscreen))
+            .unwrap()
+    }
 }
 
+/// Overlay controls for the video player
 pub trait PlayerOverlay {
     fn show(&self, ui: &mut Ui, frame: &Response, state: &mut PlayerOverlayState);
 }
@@ -258,7 +290,7 @@ impl<T> CustomPlayer<T> {
     fn load_frame(&mut self, image: ColorImage, pts: i64, duration: i64) {
         self.frame.set(image, TextureOptions::default());
         self.frame_pts = pts;
-        self.frame_duration = (duration as f32 * self.playback_speed()) as i64;
+        self.frame_duration = (duration as f32 / self.playback_speed()) as i64;
         self.frame_counter += 1;
 
         let now = Instant::now();
@@ -313,6 +345,7 @@ impl<T> CustomPlayer<T> {
     fn handle_keys(&mut self, ui: &mut Ui) {
         const SEEK_STEP: f32 = 5.0;
         const VOLUME_STEP: f32 = 0.1;
+        const SPEED_STEP: f32 = 0.1;
 
         ui.input(|inputs| {
             for e in &inputs.events {
@@ -322,10 +355,10 @@ impl<T> CustomPlayer<T> {
                             self.toggle_play_pause();
                         }
                         Key::OpenBracket => {
-                            self.playback_speed.fetch_sub(1, Ordering::Relaxed);
+                            self.set_playback_speed(self.playback_speed() - SPEED_STEP);
                         }
                         Key::CloseBracket => {
-                            self.playback_speed.fetch_add(1, Ordering::Relaxed);
+                            self.set_playback_speed(self.playback_speed() + SPEED_STEP);
                         }
                         Key::ArrowRight => {
                             self.seek(self.elapsed() + SEEK_STEP);
@@ -334,17 +367,20 @@ impl<T> CustomPlayer<T> {
                             self.seek(self.elapsed() - SEEK_STEP);
                         }
                         Key::ArrowUp => {
-                            self.set_volume_f32(self.volume_f32() + VOLUME_STEP);
+                            self.set_volume(self.volume() + VOLUME_STEP);
                         }
                         Key::ArrowDown => {
-                            self.set_volume_f32(self.volume_f32() - VOLUME_STEP);
+                            self.set_volume(self.volume() - VOLUME_STEP);
                         }
                         Key::F => {
-                            self.fullscreen = !self.fullscreen;
+                            self.set_fullscreen(!self.fullscreen());
                             self.ctx.send_viewport_cmd_to(
                                 ViewportId::ROOT,
                                 ViewportCommand::Fullscreen(self.fullscreen),
                             );
+                        }
+                        Key::F1 => {
+                            self.set_debug(!self.debug());
                         }
                         _ => {}
                     },
@@ -413,6 +449,9 @@ impl<T> CustomPlayer<T> {
                     self.error = Some(e);
                     self.stop();
                 }
+                MediaPlayerData::DecoderInfo(i) => {
+                    self.decoders.push(i);
+                }
             }
         }
 
@@ -449,6 +488,7 @@ impl<T> CustomPlayer<T> {
                 self.set_playback_speed(s);
             }
             PlayerMessage::SetMaintainAspect(a) => self.set_maintain_aspect(a),
+            PlayerMessage::SetFullscreen(f) => self.set_fullscreen(f),
         }
     }
 
@@ -526,6 +566,11 @@ impl<T> CustomPlayer<T> {
         Duration::from_secs_f64(self.pts_to_sec(pts))
     }
 
+    fn show_osd(&mut self, msg: &str) {
+        self.osd = Some(msg.to_string());
+        self.osd_end = Instant::now() + Duration::from_secs(2);
+    }
+
     fn debug_inner(&mut self, frame_response: Rect) -> LayoutJob {
         let v_pts = self.elapsed();
         let a_pts = self
@@ -555,7 +600,7 @@ impl<T> CustomPlayer<T> {
                 "\nplayback: {:.2} fps ({:.2}x), volume={:.0}%, resolution={}x{}",
                 self.avg_fps,
                 self.avg_fps / self.framerate(),
-                100.0 * self.volume_f32(),
+                100.0 * self.volume(),
                 video_size.x,
                 video_size.y
             ),
@@ -582,22 +627,34 @@ impl<T> CustomPlayer<T> {
                 font.clone(),
             );
 
-            if let Some(bv) = info.best_video() {
-                layout.append(&format!("\n{}", bv), 0.0, font.clone());
+            fn print_chan(
+                layout: &mut LayoutJob,
+                font: TextFormat,
+                chan: Option<&StreamInfoChannel>,
+                decoders: &Vec<DecoderInfo>,
+            ) {
+                if let Some(c) = chan {
+                    layout.append(&format!("\n{}", c), 0.0, font.clone());
+                    if let Some(decoder) = decoders.iter().find(|d| d.index == c.index) {
+                        layout.append(&format!("\n\tdecoder={}", decoder.codec), 0.0, font.clone());
+                    }
+                }
             }
-            if let Some(ba) = info.best_audio() {
-                layout.append(&format!("\n{}", ba), 0.0, font.clone());
-            }
-            if let Some(bs) = info.best_subtitle() {
-                layout.append(&format!("\n{}", bs), 0.0, font.clone());
-            }
+            print_chan(&mut layout, font.clone(), info.best_video(), &self.decoders);
+            print_chan(&mut layout, font.clone(), info.best_audio(), &self.decoders);
+            print_chan(
+                &mut layout,
+                font.clone(),
+                info.best_subtitle(),
+                &self.decoders,
+            );
         }
 
         layout
     }
 
     fn open_default_audio_stream(
-        volume: Arc<AtomicU8>,
+        volume: Arc<AtomicU16>,
         state: Arc<AtomicU8>,
         rx: Receiver<MediaPlayerData>,
     ) -> Option<PlayerAudioStream> {
@@ -652,7 +709,7 @@ impl<T> CustomPlayer<T> {
                                     buf.take_samples(drop_samples);
                                     warn!("Audio: dropping {drop_samples} samples, playback is too fast!");
                                 }
-                                let v = volume.load(Ordering::Relaxed) as f32 / u8::MAX as f32;
+                                let v = volume.load(Ordering::Relaxed) as f32 / u16::MAX as f32;
                                 let w_len = dst.len().min(buf.samples.len());
                                 let mut i = 0;
                                 for s in buf.take_samples(w_len) {
@@ -685,9 +742,9 @@ impl<T> CustomPlayer<T> {
     /// Create a new [`CustomPlayer`].
     pub fn new(overlay: T, ctx: &egui::Context, input_path: &String) -> Self {
         // volume arc
-        let vol = Arc::new(AtomicU8::new(200));
+        let vol = Arc::new(AtomicU16::new(u16::MAX));
         let state = Arc::new(AtomicU8::new(PlayerState::Stopped as u8));
-        let playback_speed = Arc::new(AtomicU8::new(127));
+        let playback_speed = Arc::new(AtomicI16::new(100));
 
         // Open audio device
         let (tx, rx) = mpsc::channel();
@@ -718,6 +775,7 @@ impl<T> CustomPlayer<T> {
             frame_pts: 0,
             frame_duration: 0,
             info: None,
+            decoders: vec![],
             ctx: ctx.clone(),
             audio,
             subtitle: None,
@@ -728,8 +786,10 @@ impl<T> CustomPlayer<T> {
             frame_counter: 0,
             last_frame_counter: 0,
             error: None,
+            osd: None,
             maintain_aspect: true,
             fullscreen: false,
+            osd_end: Instant::now(),
         }
     }
 }
@@ -772,12 +832,14 @@ impl<T> PlayerControls for CustomPlayer<T> {
     fn pause(&mut self) {
         self.state
             .store(PlayerState::Paused as u8, Ordering::Relaxed);
+        self.show_osd("Pause");
     }
 
     /// Start the stream.
     fn start(&mut self) {
         self.state
             .store(PlayerState::Playing as u8, Ordering::Relaxed);
+        self.show_osd("Play");
         if self.media_player.start() {
             self.frame_counter = 0;
             self.frame_start = Instant::now();
@@ -802,6 +864,7 @@ impl<T> PlayerControls for CustomPlayer<T> {
     fn stop(&mut self) {
         self.state
             .store(PlayerState::Stopped as u8, Ordering::Relaxed);
+        self.show_osd("Stop");
     }
 
     /// Seek to a location in the stream.
@@ -809,21 +872,14 @@ impl<T> PlayerControls for CustomPlayer<T> {
         self.media_player.seek_to(pos);
     }
 
-    fn set_volume(&mut self, volume: u8) {
-        self.volume.store(volume, Ordering::Relaxed);
+    fn volume(&self) -> f32 {
+        self.volume.load(Ordering::Relaxed) as f32 / u16::MAX as f32
     }
 
-    fn volume(&self) -> u8 {
-        self.volume.load(Ordering::Relaxed)
-    }
-
-    fn volume_f32(&self) -> f32 {
-        self.volume() as f32 / u8::MAX as f32
-    }
-
-    fn set_volume_f32(&mut self, volume: f32) {
-        let new_volume = (u8::MAX as f32 * volume) as u8;
-        self.set_volume(new_volume);
+    fn set_volume(&mut self, volume: f32) {
+        let new_volume = (u16::MAX as f32 * volume) as u16;
+        self.volume.store(new_volume, Ordering::Relaxed);
+        self.show_osd(&format!("Volume: {:.0}%", 100.0 * volume));
     }
 
     fn looping(&self) -> bool {
@@ -832,6 +888,7 @@ impl<T> PlayerControls for CustomPlayer<T> {
 
     fn set_looping(&mut self, looping: bool) {
         self.looping = looping;
+        self.show_osd(if looping { "Loop: yes" } else { "Loop: no" });
     }
 
     fn debug(&self) -> bool {
@@ -840,15 +897,17 @@ impl<T> PlayerControls for CustomPlayer<T> {
 
     fn set_debug(&mut self, debug: bool) {
         self.debug = debug;
+        self.show_osd(if debug { "Debug: yes" } else { "Debug: no" });
     }
 
     fn playback_speed(&self) -> f32 {
-        127.0 / self.playback_speed.load(Ordering::Relaxed) as f32
+        self.playback_speed.load(Ordering::Relaxed) as f32 / 100.0
     }
 
     fn set_playback_speed(&mut self, speed: f32) {
-        self.playback_speed
-            .store((u8::MAX as f32 * speed) as u8, Ordering::Relaxed);
+        let new_speed = (100.0 * speed.max(0.01)).round() as i16;
+        self.playback_speed.store(new_speed, Ordering::Relaxed);
+        self.show_osd(&format!("Speed: {:.2}x", speed));
     }
 
     fn maintain_aspect(&self) -> bool {
@@ -857,6 +916,14 @@ impl<T> PlayerControls for CustomPlayer<T> {
 
     fn set_maintain_aspect(&mut self, maintain_aspect: bool) {
         self.maintain_aspect = maintain_aspect;
+    }
+
+    fn fullscreen(&self) -> bool {
+        self.fullscreen
+    }
+
+    fn set_fullscreen(&mut self, fullscreen: bool) {
+        self.fullscreen = fullscreen;
     }
 }
 
@@ -879,6 +946,18 @@ where
                 error,
                 FontId::proportional(30.),
                 Color32::DARK_RED,
+            );
+        }
+        if self.osd_end < Instant::now() {
+            self.osd.take();
+        }
+        if let Some(osd) = &self.osd {
+            ui.painter().text(
+                pos2(size.x - 10.0, 50.0),
+                Align2::RIGHT_TOP,
+                osd,
+                FontId::proportional(20.),
+                Color32::WHITE,
             );
         }
         if self.debug {
@@ -905,6 +984,7 @@ where
             debug: self.debug,
             state: self.state(),
             maintain_aspect: self.maintain_aspect,
+            fullscreen: self.fullscreen,
             inbox: inbox.sender(),
         };
         self.overlay.show(ui, frame, &mut state);

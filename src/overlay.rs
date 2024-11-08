@@ -118,7 +118,7 @@ impl PlayerOverlay for DefaultOverlay {
         } else {
             "⏸"
         };
-        let audio_volume_frac = p.volume_f32();
+        let audio_volume_frac = p.volume();
         let sound_icon = if audio_volume_frac > 0.7 {
             "🔊"
         } else if audio_volume_frac > 0.4 {
@@ -319,10 +319,10 @@ impl PlayerOverlay for DefaultOverlay {
             )
             .clicked()
         {
-            if p.volume() != 0 {
-                p.set_volume(0);
+            if p.volume() != 0.0 {
+                p.set_volume(0.0);
             } else {
-                p.set_volume(50)
+                p.set_volume(1.0)
             }
         }
 
@@ -352,7 +352,7 @@ impl PlayerOverlay for DefaultOverlay {
             Color32::from_white_alpha(contraster_alpha).linear_multiply(sound_anim_frac);
         let mut sound_bar_rect = sound_slider_rect;
         sound_bar_rect
-            .set_top(sound_bar_rect.bottom() - audio_volume_frac * sound_bar_rect.height());
+            .set_top(sound_bar_rect.bottom() - (sound_bar_rect.height() * audio_volume_frac));
 
         ui.painter()
             .rect_filled(sound_slider_rect, Rounding::same(5.), sound_slider_bg_color);
@@ -370,7 +370,7 @@ impl PlayerOverlay for DefaultOverlay {
                     - ((hover_pos - sound_slider_rect.left_top()).y / sound_slider_rect.height())
                         .max(0.)
                         .min(1.);
-                p.set_volume_f32(sound_frac);
+                p.set_volume(sound_frac);
             }
         }
     }
