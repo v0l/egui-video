@@ -10,7 +10,15 @@ use nom::number::complete::double;
 use nom::sequence::{delimited, pair, preceded, tuple};
 use nom::IResult;
 
-use super::{FadeEffect, Subtitle, SubtitleField};
+use super::{FadeEffect, Subtitle};
+
+enum SubtitleField<'a> {
+    Fade(FadeEffect),
+    Alignment(Align2),
+    PrimaryFill(Color32),
+    Position(Pos2),
+    Undefined(&'a str),
+}
 
 fn num_list(i: &str) -> IResult<&str, Vec<f64>> {
     delimited(char('('), separated_list0(char(','), double), char(')'))(i)

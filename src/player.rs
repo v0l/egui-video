@@ -684,12 +684,12 @@ impl<T> CustomPlayer<T> {
 
     /// Create a new [`CustomPlayer`].
     pub fn new(overlay: T, ctx: &egui::Context, input_path: &String) -> Self {
-        /// volume arc
+        // volume arc
         let vol = Arc::new(AtomicU8::new(200));
         let state = Arc::new(AtomicU8::new(PlayerState::Stopped as u8));
         let playback_speed = Arc::new(AtomicU8::new(127));
 
-        /// Open audio device
+        // Open audio device
         let (tx, rx) = mpsc::channel();
         let audio = Self::open_default_audio_stream(vol.clone(), state.clone(), rx);
 
