@@ -1,5 +1,5 @@
 use crate::audio::{AudioBuffer, PlayerAudioStream};
-use crate::media_player::{DecoderInfo, MediaPlayer, MediaPlayerData};
+use crate::media_player::{AudioSamplesData, DecoderInfo, MediaPlayer, MediaPlayerData};
 #[cfg(feature = "subtitles")]
 use crate::subtitle::Subtitle;
 use crate::AudioDevice;
@@ -14,7 +14,7 @@ use egui::{
 };
 use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
-use ffmpeg_rs_raw::{format_time, DemuxerInfo, StreamInfoChannel};
+use ffmpeg_rs_raw::{format_time, DemuxerInfo, StreamInfo};
 use log::{trace, warn};
 use std::sync::atomic::{AtomicI16, AtomicU16, AtomicU8, Ordering};
 use std::sync::mpsc::Receiver;
@@ -432,10 +432,10 @@ impl<T> CustomPlayer<T> {
                     self.request_repaint_for_next_frame();
                     break;
                 }
-                MediaPlayerData::AudioSamples(pts, duration, s) => {
+                MediaPlayerData::AudioSamples(data) => {
                     if let Some(a) = self.audio.as_mut() {
                         if let Ok(mut q) = a.buffer.lock() {
-                            q.add_samples(s);
+                            q.add_samples(data.samples);
                         }
                     }
                 }
@@ -630,7 +630,7 @@ impl<T> CustomPlayer<T> {
             fn print_chan(
                 layout: &mut LayoutJob,
                 font: TextFormat,
-                chan: Option<&StreamInfoChannel>,
+                chan: Option<&StreamInfo>,
                 decoders: &Vec<DecoderInfo>,
             ) {
                 if let Some(c) = chan {
@@ -656,7 +656,7 @@ impl<T> CustomPlayer<T> {
     fn open_default_audio_stream(
         volume: Arc<AtomicU16>,
         state: Arc<AtomicU8>,
-        rx: Receiver<MediaPlayerData>,
+        rx: Receiver<AudioSamplesData>,
     ) -> Option<PlayerAudioStream> {
         if let Ok(a) = AudioDevice::new() {
             if let Ok(cfg) = a.0.default_output_config() {
@@ -680,12 +680,7 @@ impl<T> CustomPlayer<T> {
                             if let Ok(mut buf) = b_clone.lock() {
                                 // take samples from channel
                                 while let Ok(m) = rx.try_recv() {
-                                    match m {
-                                        MediaPlayerData::AudioSamples(_, _, samples) => {
-                                            buf.add_samples(samples)
-                                        }
-                                        _ => panic!("Unexpected message in audio channel"),
-                                    }
+                                    buf.add_samples(m.samples);
                                 }
                                 // do nothing, leave silence in dst
                                 if state == PlayerState::Paused as u8 {

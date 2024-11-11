@@ -8,7 +8,7 @@ use crate::hls::DemuxerIsh;
 #[cfg(feature = "hls")]
 use crate::hls::HlsStream;
 
-use anyhow::Error;
+use anyhow::{Error, Result};
 use egui::{Color32, ColorImage, Vec2};
 use ffmpeg_rs_raw::{get_frame_from_hw, rstr, Decoder, Demuxer, DemuxerInfo, Resample, Scaler};
 use log::{error, trace, warn};
@@ -104,15 +104,22 @@ pub enum MediaPlayerData {
     /// Video frame from the decoder
     VideoFrame(i64, i64, ColorImage),
     /// Audio samples from the decoder
-    AudioSamples(i64, i64, Vec<f32>),
+    AudioSamples(AudioSamplesData),
     /// Subtitle frames from the decoder
     Subtitles(i64, i64, String, AVCodecID),
+}
+
+#[derive(Debug)]
+pub struct AudioSamplesData {
+    pub pts: i64,
+    pub duration: i64,
+    pub samples: Vec<f32>,
 }
 
 impl MediaPlayerData {
     pub fn pts(&self) -> i64 {
         match self {
-            MediaPlayerData::AudioSamples(pts, _, _) => *pts,
+            MediaPlayerData::AudioSamples(a) => a.pts,
             MediaPlayerData::VideoFrame(pts, _, _) => *pts,
             MediaPlayerData::Subtitles(pts, _, _, _) => *pts,
             _ => 0,
@@ -153,7 +160,7 @@ struct MediaPlayerState {
     pub running: Arc<AtomicBool>,
     pub buffer_size: Arc<AtomicI32>,
     pub media_queue: Arc<Mutex<BinaryHeap<MediaPlayerData>>>,
-    pub audio_chan: Option<Sender<MediaPlayerData>>,
+    pub audio_chan: Option<Sender<AudioSamplesData>>,
     pub tbn_num: Arc<AtomicI32>,
     pub tbn_den: Arc<AtomicI32>,
     pub seek_to: Arc<Mutex<Option<f32>>>,
@@ -227,7 +234,7 @@ impl MediaPlayer {
         self.state.tbn()
     }
 
-    pub fn with_audio_chan(mut self, chan: Sender<MediaPlayerData>) -> Self {
+    pub fn with_audio_chan(mut self, chan: Sender<AudioSamplesData>) -> Self {
         self.state.audio_chan = Some(chan);
         self
     }
@@ -329,11 +336,20 @@ impl MediaPlayer {
         let input = self.input.clone();
         let q_err = self.state.media_queue.clone();
         self.thread = Some(std::thread::spawn(move || {
-            let media_thread = MediaPlayerThread::new(&input, state);
-            if let Err(e) = unsafe { media_thread.run() } {
-                error!("{}", e);
-                if let Ok(mut q) = q_err.lock() {
-                    q.push(MediaPlayerData::Error(e.to_string()));
+            match MediaPlayerThread::new(&input, state) {
+                Ok(media_thread) => {
+                    if let Err(e) = unsafe { media_thread.run() } {
+                        error!("{}", e);
+                        if let Ok(mut q) = q_err.lock() {
+                            q.push(MediaPlayerData::Error(e.to_string()));
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("{}", e);
+                    if let Ok(mut q) = q_err.lock() {
+                        q.push(MediaPlayerData::Error(e.to_string()));
+                    }
                 }
             }
         }));
@@ -380,33 +396,33 @@ impl Display for MediaPlayerThread {
 }
 
 impl MediaPlayerThread {
-    pub fn new(input: &str, state: MediaPlayerState) -> MediaPlayerThread {
+    pub fn new(input: &str, state: MediaPlayerState) -> Result<MediaPlayerThread> {
         let sr = state.sample_rate.load(Ordering::Relaxed);
         let mut decoder = Decoder::new();
         decoder.enable_hw_decoder_any();
 
-        Self {
+        Ok(Self {
             state,
-            demuxer: Self::open_demuxer(input),
+            demuxer: Self::open_demuxer(input)?,
             decoder,
             scale: Scaler::new(),
             resample: Resample::new(AVSampleFormat::AV_SAMPLE_FMT_FLT, sr, 2),
             media_info: None,
-        }
+        })
     }
 
     #[cfg(feature = "hls")]
-    fn open_demuxer(input: &str) -> Box<dyn DemuxerIsh> {
+    fn open_demuxer(input: &str) -> Result<Box<dyn DemuxerIsh>> {
         if input.contains(".m3u8") {
-            Box::new(HlsStream::new(input))
+            Ok(Box::new(HlsStream::new(input)))
         } else {
-            Box::new(Demuxer::new(input))
+            Ok(Box::new(Demuxer::new(input)?))
         }
     }
 
     #[cfg(not(feature = "hls"))]
-    fn open_demuxer(input: &str) -> Demuxer {
-        Demuxer::new(input)
+    fn open_demuxer(input: &str) -> Result<Demuxer> {
+        Ok(Demuxer::new(input)?)
     }
 
     unsafe fn run(mut self) -> Result<(), Error> {
@@ -429,7 +445,7 @@ impl MediaPlayerThread {
                             .media_queue
                             .lock()
                             .map_err(|e| Error::msg(e.to_string()))?;
-                        for c in &p.channels {
+                        for c in &p.streams {
                             let ctx = self.decoder.setup_decoder(c, None)?;
                             q.push(MediaPlayerData::DecoderInfo(DecoderInfo {
                                 index: c.index,
@@ -483,9 +499,9 @@ impl MediaPlayerThread {
             if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO
                 || media_type == AVMediaType::AVMEDIA_TYPE_AUDIO
             {
-                match self.decoder.decode_pkt(pkt, stream) {
+                match self.decoder.decode_pkt(pkt) {
                     Ok(frames) => {
-                        for (frame, stream) in frames {
+                        for frame in frames {
                             let mut frame = self.process_frame(frame, stream)?;
                             av_frame_free(&mut frame);
                         }
@@ -513,10 +529,12 @@ impl MediaPlayerThread {
     }
 
     /// Push message to queue
-    fn send_decoder_msg(&self, msg: MediaPlayerData) -> Result<(), Error> {
-        if matches!(msg, MediaPlayerData::AudioSamples(_, _, _)) {
-            if let Some(audio) = self.state.audio_chan.as_ref() {
-                audio.send(msg)?;
+    fn send_decoder_msg(&self, msg: MediaPlayerData) -> Result<()> {
+        if self.state.audio_chan.is_some() {
+            if let MediaPlayerData::AudioSamples(s) = msg {
+                if let Some(audio) = self.state.audio_chan.as_ref() {
+                    audio.send(s)?;
+                }
                 return Ok(());
             }
         }
@@ -595,7 +613,12 @@ impl MediaPlayerThread {
             let size = ((*frame).nb_samples * plane_mul) as usize;
 
             let samples = slice::from_raw_parts((*frame).data[0] as *const f32, size);
-            let msg = MediaPlayerData::AudioSamples(pts, duration, samples.to_vec());
+            let data = AudioSamplesData {
+                pts,
+                duration,
+                samples: samples.to_vec(),
+            };
+            let msg = MediaPlayerData::AudioSamples(data);
             self.send_decoder_msg(msg)?;
             av_frame_free(&mut frame);
         } else {
