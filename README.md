@@ -3,7 +3,7 @@
 [![docs](https://docs.rs/egui-video/badge.svg)](https://docs.rs/egui-video/latest/egui_video/)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/n00kii/egui-video/blob/main/README.md)
 
-https://github.com/n00kii/egui-video/assets/57325298/c618ff0a-9ad2-4cf0-b14a-dda65dc54b23
+![preview](https://nostr.download/98fa7ef84601f2ac1643d8de491a30571cb51273e9478c11fa6717312c82cf4f)
 
 Plays videos in egui from any source FFMPEG supports.
 
