@@ -19,7 +19,7 @@ hls = ["dep:m3u8-rs", "dep:ureq", "dep:url", "dep:itertools"]
 egui = "^0.29"
 anyhow = "^1.0.86"
 cpal = { version = "0.15.3", features = ["oboe-shared-stdcxx"] }
-ffmpeg-rs-raw = { git = "https://git.v0l.io/Kieran/ffmpeg-rs-raw.git", rev = "bb11e998e759b0332c22703844f448fb2ea3b4b5" }
+ffmpeg-rs-raw = { git = "https://git.v0l.io/Kieran/ffmpeg-rs-raw.git", rev = "c3d1084716d7507d79861db837f522d46a6b47a4" }
 atomic = "0.6.0"
 log = "0.4.22"
 egui_inbox = "^0.6.0"
