@@ -20,7 +20,8 @@ impl Default for App {
     fn default() -> Self {
         Self {
             audio_device: AudioDevice::new().unwrap(),
-            media_path: "https://test-streams.mux.dev/tos_ismc/main.m3u8".to_string(),
+            media_path: "https://data.zap.stream/stream/c5eccf48-8cc4-4e5d-9c66-fa18fdc08fdb.m3u8"
+                .to_string(),
             player: None,
         }
     }

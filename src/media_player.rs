@@ -172,7 +172,7 @@ impl Default for MediaPlayerState {
 
         Self {
             running: Arc::new(AtomicBool::new(true)),
-            buffer_size: Arc::new(AtomicI32::new(DEFAULT_TBN)),
+            buffer_size: Arc::new(AtomicI32::new(DEFAULT_TBN * 3)),
             tbn_num: Arc::new(AtomicI32::new(1)),
             tbn_den: Arc::new(AtomicI32::new(DEFAULT_TBN)),
 
@@ -258,7 +258,11 @@ impl MediaPlayer {
     }
 
     /// Set the audio sample rate, all samples are stereo f32
+    /// This MUST be set, otherwise you won't get any audio data
     pub fn set_target_sample_rate(&self, sample_rate: u32) {
+        if sample_rate == 0 {
+            return;
+        }
         self.state.sample_rate.store(sample_rate, Ordering::Relaxed);
     }
 
@@ -365,7 +369,7 @@ struct MediaPlayerThread {
     demuxer: Demuxer,
     decoder: Decoder,
     scale: Scaler,
-    resample: Resample,
+    resample: Option<Resample>,
     media_info: Option<DemuxerInfo>,
 }
 
@@ -397,7 +401,6 @@ impl Display for MediaPlayerThread {
 
 impl MediaPlayerThread {
     pub fn new(input: &str, state: MediaPlayerState) -> Result<MediaPlayerThread> {
-        let sr = state.sample_rate.load(Ordering::Relaxed);
         let mut decoder = Decoder::new();
         decoder.enable_hw_decoder_any();
 
@@ -406,7 +409,7 @@ impl MediaPlayerThread {
             demuxer: Self::open_demuxer(input)?,
             decoder,
             scale: Scaler::new(),
-            resample: Resample::new(AVSampleFormat::AV_SAMPLE_FMT_FLT, sr, 2),
+            resample: None,
             media_info: None,
         })
     }
@@ -509,6 +512,7 @@ impl MediaPlayerThread {
                     Err(e) => warn!("failed to decode packet: {}", e),
                 }
             } else if media_type == AVMediaType::AVMEDIA_TYPE_SUBTITLE {
+                // TODO: avcodec_decode_subtitle2
                 let subs = CStr::from_ptr((*pkt).data as _).to_str()?;
                 let (pts, duration) = self.get_pkt_time(pkt, stream);
                 self.send_decoder_msg(MediaPlayerData::Subtitles(
@@ -556,7 +560,17 @@ impl MediaPlayerThread {
         } else {
             (*stream).start_time
         };
-        let pts = av_rescale_q((*frame).pts - stream_start, (*stream).time_base, tbn);
+        let pts = if (*frame).pts == AV_NOPTS_VALUE {
+            0
+        } else {
+            (*frame).pts
+        };
+        let pts = pts - stream_start;
+        let pts = if pts != 0 {
+            av_rescale_q(pts, (*stream).time_base, tbn)
+        } else {
+            0
+        };
         let duration = av_rescale_q((*frame).duration, (*stream).time_base, tbn);
         (pts, duration)
     }
@@ -580,7 +594,7 @@ impl MediaPlayerThread {
         frame: *mut AVFrame,
         stream: *mut AVStream,
     ) -> Result<*mut AVFrame, Error> {
-        let frame = get_frame_from_hw(frame)?;
+        let mut frame = get_frame_from_hw(frame)?;
         let (pts, duration) = self.get_frame_time(frame, stream);
         let media_type = (*(*stream).codecpar).codec_type;
 
@@ -603,24 +617,31 @@ impl MediaPlayerThread {
                     }
                 });
         } else if media_type == AVMediaType::AVMEDIA_TYPE_AUDIO {
-            let mut frame = self.resample.process_frame(frame)?;
-            let is_planar = av_sample_fmt_is_planar(transmute((*frame).format)) == 1;
-            let plane_mul = if is_planar {
-                1
-            } else {
-                (*frame).ch_layout.nb_channels
-            };
-            let size = ((*frame).nb_samples * plane_mul) as usize;
+            let sr = self.state.sample_rate.load(Ordering::Relaxed);
+            if self.resample.is_none() && sr != 0 {
+                self.resample = Some(Resample::new(AVSampleFormat::AV_SAMPLE_FMT_FLT, sr, 2));
+            }
+            if let Some(resampler) = &mut self.resample {
+                let mut new_frame = resampler.process_frame(frame)?;
+                av_frame_free(&mut frame);
+                let is_planar = av_sample_fmt_is_planar(transmute((*new_frame).format)) == 1;
+                let plane_mul = if is_planar {
+                    1
+                } else {
+                    (*new_frame).ch_layout.nb_channels
+                };
+                let size = ((*new_frame).nb_samples * plane_mul) as usize;
 
-            let samples = slice::from_raw_parts((*frame).data[0] as *const f32, size);
-            let data = AudioSamplesData {
-                pts,
-                duration,
-                samples: samples.to_vec(),
-            };
-            let msg = MediaPlayerData::AudioSamples(data);
-            self.send_decoder_msg(msg)?;
-            av_frame_free(&mut frame);
+                let samples = slice::from_raw_parts((*new_frame).data[0] as *const f32, size);
+                let data = AudioSamplesData {
+                    pts,
+                    duration,
+                    samples: samples.to_vec(),
+                };
+                let msg = MediaPlayerData::AudioSamples(data);
+                self.send_decoder_msg(msg)?;
+                av_frame_free(&mut new_frame);
+            }
         } else {
             warn!(
                 "unsupported frame type: {}",

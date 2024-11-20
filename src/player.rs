@@ -15,7 +15,7 @@ use egui::{
 use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
 use ffmpeg_rs_raw::{format_time, DemuxerInfo, StreamInfo};
-use log::{trace, warn};
+use log::{debug, info, trace};
 use std::sync::atomic::{AtomicI16, AtomicU16, AtomicU8, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{mpsc, Arc, Mutex};
@@ -660,6 +660,12 @@ impl<T> CustomPlayer<T> {
     ) -> Option<PlayerAudioStream> {
         if let Ok(a) = AudioDevice::new() {
             if let Ok(cfg) = a.0.default_output_config() {
+                info!(
+                    "Default audio device config: {}Hz, {}ch, {:?}",
+                    cfg.sample_rate().0,
+                    cfg.channels(),
+                    cfg.sample_format()
+                );
                 let buffer = Arc::new(Mutex::new(AudioBuffer::new(
                     cfg.sample_rate().0,
                     cfg.channels() as u8,
@@ -694,15 +700,15 @@ impl<T> CustomPlayer<T> {
                                 if buf.samples.len() < dst.len() {
                                     drop(buf);
                                     std::thread::sleep(Duration::from_millis(5));
-                                    warn!("Audio: buffer underrun, playback is too slow!");
+                                    debug!("Audio: buffer underrun, playback is too slow!");
                                     continue;
                                 }
                                 // lazy audio sync
                                 let sync = buf.video_pos - buf.audio_pos;
                                 if sync > 0.1 {
-                                    let drop_samples = buf.audio_delay_samples() as usize;
-                                    buf.take_samples(drop_samples);
-                                    warn!("Audio: dropping {drop_samples} samples, playback is too fast!");
+                                    //let drop_samples = buf.audio_delay_samples() as usize;
+                                    //buf.take_samples(drop_samples);
+                                    //debug!("Audio: dropping {drop_samples} samples, playback is too fast!");
                                 }
                                 let v = volume.load(Ordering::Relaxed) as f32 / u16::MAX as f32;
                                 let w_len = dst.len().min(buf.samples.len());
@@ -745,8 +751,9 @@ impl<T> CustomPlayer<T> {
         let (tx, rx) = mpsc::channel();
         let audio = Self::open_default_audio_stream(vol.clone(), state.clone(), rx);
 
-        let media_player = MediaPlayer::new(input_path).with_audio_chan(tx);
+        let mut media_player = MediaPlayer::new(input_path);
         if let Some(a) = &audio {
+            media_player = media_player.with_audio_chan(tx);
             media_player.set_target_sample_rate(a.config.sample_rate().0);
         }
 
