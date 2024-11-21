@@ -118,6 +118,14 @@ impl PlayerControls for Player {
     fn set_fullscreen(&mut self, fullscreen: bool) {
         self.inner.set_fullscreen(fullscreen)
     }
+
+    fn key_binds(&self) -> bool {
+        self.inner.key_binds()
+    }
+
+    fn set_key_binds(&mut self, key_binds: bool) {
+        self.inner.set_key_binds(key_binds)
+    }
 }
 
 impl Widget for &mut Player {

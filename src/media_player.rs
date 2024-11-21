@@ -1,7 +1,7 @@
 use crate::ffmpeg_sys_the_third::{
     av_frame_free, av_frame_unref, av_get_media_type_string, av_packet_free, av_rescale_q,
     av_sample_fmt_is_planar, AVCodecID, AVFrame, AVMediaType, AVPacket, AVPixelFormat, AVRational,
-    AVSampleFormat, AVStream, AV_NOPTS_VALUE, LIBAVCODEC_VERSION_MAJOR, LIBAVUTIL_VERSION_MAJOR,
+    AVSampleFormat, AVStream, AV_NOPTS_VALUE,
 };
 #[cfg(feature = "hls")]
 use crate::hls::DemuxerIsh;
@@ -10,7 +10,6 @@ use crate::hls::HlsStream;
 
 use anyhow::{Error, Result};
 use egui::{Color32, ColorImage, Vec2};
-use ffmpeg_rs_raw::ffmpeg_sys_the_third::{LIBAVCODEC_VERSION_MINOR, LIBAVUTIL_VERSION_MINOR};
 use ffmpeg_rs_raw::{
     get_frame_duration, get_frame_from_hw, rstr, Decoder, Demuxer, DemuxerInfo, Resample, Scaler,
 };

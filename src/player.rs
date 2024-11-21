@@ -45,6 +45,8 @@ enum PlayerMessage {
     SetMaintainAspect(bool),
     /// Change fullscreen state
     SetFullscreen(bool),
+    /// Change key_binds state
+    SetKeyBinds(bool),
 }
 
 /// The [`CustomPlayer`] processes and controls streams of video/audio.
@@ -77,6 +79,8 @@ pub struct CustomPlayer<T> {
     maintain_aspect: bool,
     /// If player should fullscreen
     fullscreen: bool,
+    /// If key resses should be handled
+    key_binds: bool,
 
     /// Stream info
     info: Option<DemuxerInfo>,
@@ -157,6 +161,10 @@ pub trait PlayerControls {
     fn fullscreen(&self) -> bool;
     /// Set player is fullscreen or not
     fn set_fullscreen(&mut self, fullscreen: bool);
+    /// If keyboard inputs are accepted
+    fn key_binds(&self) -> bool;
+    /// Set if keyboard inputs are handled
+    fn set_key_binds(&mut self, key_binds: bool);
 }
 
 /// Wrapper to store player info and pass to overlay impl
@@ -172,6 +180,7 @@ pub struct PlayerOverlayState {
     state: PlayerState,
     maintain_aspect: bool,
     fullscreen: bool,
+    key_binds: bool,
     inbox: UiInboxSender<PlayerMessage>,
 }
 
@@ -271,6 +280,16 @@ impl PlayerControls for PlayerOverlayState {
             .send(PlayerMessage::SetFullscreen(fullscreen))
             .unwrap()
     }
+
+    fn key_binds(&self) -> bool {
+        self.key_binds
+    }
+
+    fn set_key_binds(&mut self, key_binds: bool) {
+        self.inbox
+            .send(PlayerMessage::SetKeyBinds(key_binds))
+            .unwrap()
+    }
 }
 
 /// Overlay controls for the video player
@@ -346,6 +365,10 @@ impl<T> CustomPlayer<T> {
         const SEEK_STEP: f32 = 5.0;
         const VOLUME_STEP: f32 = 0.1;
         const SPEED_STEP: f32 = 0.1;
+
+        if !self.key_binds {
+            return;
+        }
 
         ui.input(|inputs| {
             for e in &inputs.events {
@@ -489,6 +512,7 @@ impl<T> CustomPlayer<T> {
             }
             PlayerMessage::SetMaintainAspect(a) => self.set_maintain_aspect(a),
             PlayerMessage::SetFullscreen(f) => self.set_fullscreen(f),
+            PlayerMessage::SetKeyBinds(f) => self.set_key_binds(f),
         }
     }
 
@@ -762,6 +786,7 @@ impl<T> CustomPlayer<T> {
             state,
             playback_speed,
             overlay,
+            key_binds: false,
             input_path: input_path.clone(),
             looping: true,
             volume: vol,
@@ -927,6 +952,14 @@ impl<T> PlayerControls for CustomPlayer<T> {
     fn set_fullscreen(&mut self, fullscreen: bool) {
         self.fullscreen = fullscreen;
     }
+
+    fn key_binds(&self) -> bool {
+        self.key_binds
+    }
+
+    fn set_key_binds(&mut self, key_binds: bool) {
+        self.key_binds = key_binds;
+    }
 }
 
 impl<T> Widget for &mut CustomPlayer<T>
@@ -987,6 +1020,7 @@ where
             state: self.state(),
             maintain_aspect: self.maintain_aspect,
             fullscreen: self.fullscreen,
+            key_binds: self.key_binds,
             inbox: inbox.sender(),
         };
         self.overlay.show(ui, frame, &mut state);
