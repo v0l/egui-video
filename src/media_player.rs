@@ -1,7 +1,7 @@
 use crate::ffmpeg_sys_the_third::{
     av_frame_free, av_frame_unref, av_get_media_type_string, av_packet_free, av_rescale_q,
     av_sample_fmt_is_planar, AVCodecID, AVFrame, AVMediaType, AVPacket, AVPixelFormat, AVRational,
-    AVSampleFormat, AVStream, AV_NOPTS_VALUE,
+    AVSampleFormat, AVStream, AV_NOPTS_VALUE, LIBAVCODEC_VERSION_MAJOR, LIBAVUTIL_VERSION_MAJOR,
 };
 #[cfg(feature = "hls")]
 use crate::hls::DemuxerIsh;
@@ -10,7 +10,10 @@ use crate::hls::HlsStream;
 
 use anyhow::{Error, Result};
 use egui::{Color32, ColorImage, Vec2};
-use ffmpeg_rs_raw::{get_frame_from_hw, rstr, Decoder, Demuxer, DemuxerInfo, Resample, Scaler};
+use ffmpeg_rs_raw::ffmpeg_sys_the_third::{LIBAVCODEC_VERSION_MINOR, LIBAVUTIL_VERSION_MINOR};
+use ffmpeg_rs_raw::{
+    get_frame_duration, get_frame_from_hw, rstr, Decoder, Demuxer, DemuxerInfo, Resample, Scaler,
+};
 use log::{error, trace, warn};
 use std::collections::BinaryHeap;
 use std::ffi::CStr;
@@ -571,7 +574,9 @@ impl MediaPlayerThread {
         } else {
             0
         };
-        let duration = av_rescale_q((*frame).duration, (*stream).time_base, tbn);
+
+        let frame_duration = get_frame_duration(frame);
+        let duration = av_rescale_q(frame_duration, (*stream).time_base, tbn);
         (pts, duration)
     }
 
