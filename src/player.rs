@@ -12,12 +12,11 @@ use egui::{
     Stroke, TextFormat, TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand, ViewportId,
     Widget,
 };
-use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
 use ffmpeg_rs_raw::{format_time, DemuxerInfo, StreamInfo};
 use log::{debug, info, trace};
 use std::sync::atomic::{AtomicI16, AtomicU16, AtomicU8, Ordering};
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -181,7 +180,7 @@ pub struct PlayerOverlayState {
     maintain_aspect: bool,
     fullscreen: bool,
     key_binds: bool,
-    inbox: UiInboxSender<PlayerMessage>,
+    inbox: Sender<PlayerMessage>,
 }
 
 impl PlayerControls for PlayerOverlayState {
@@ -1012,7 +1011,7 @@ where
     }
 
     fn render_overlay(&mut self, ui: &mut Ui, frame: &Response) {
-        let inbox = UiInbox::new();
+        let (tx, rx) = mpsc::channel();
         let mut state = PlayerOverlayState {
             elapsed: self.elapsed(),
             duration: self.duration(),
@@ -1026,13 +1025,12 @@ where
             maintain_aspect: self.maintain_aspect,
             fullscreen: self.fullscreen,
             key_binds: self.key_binds,
-            inbox: inbox.sender(),
+            inbox: tx,
         };
         self.overlay.show(ui, frame, &mut state);
 
         // drain inbox
-        let r = inbox.read(ui);
-        for m in r {
+        while let Ok(m) = rx.try_recv() {
             self.process_player_message(m);
         }
     }

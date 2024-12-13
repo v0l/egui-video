@@ -2,7 +2,10 @@ use crate::ffmpeg_sys_the_third::AVCodecID;
 use crate::subtitle::ass::parse_ass_subtitle;
 use crate::subtitle::srt::parse_srt_subtitle;
 use egui::text::LayoutJob;
-use egui::{vec2, Align2, Color32, FontId, Margin, Pos2, Response, Stroke, TextFormat, Ui, Widget};
+use egui::{
+    vec2, Align2, Color32, FontId, Margin, Pos2, Response, Sense, Stroke,
+    TextFormat, Ui, Widget,
+};
 
 mod ass;
 mod srt;
@@ -116,7 +119,6 @@ impl Widget for &Subtitle {
         painter.galley(pos, galley.clone(), Color32::TRANSPARENT);
 
         // TODO(v0l): stroke text
-
-        ui.response()
+        ui.allocate_rect(galley.rect, Sense::click())
     }
 }
