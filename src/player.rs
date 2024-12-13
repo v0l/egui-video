@@ -967,6 +967,16 @@ where
     T: PlayerOverlay,
 {
     fn ui(self, ui: &mut Ui) -> Response {
+        self.render(ui)
+    }
+}
+
+impl<T> CustomPlayer<T>
+where
+    T: PlayerOverlay,
+{
+    /// Render player in available space
+    pub fn render(&mut self, ui: &mut Ui) -> Response {
         let size = ui.available_size();
 
         self.handle_keys(ui);
@@ -1000,12 +1010,7 @@ where
         }
         frame_response
     }
-}
 
-impl<T> CustomPlayer<T>
-where
-    T: PlayerOverlay,
-{
     fn render_overlay(&mut self, ui: &mut Ui, frame: &Response) {
         let inbox = UiInbox::new();
         let mut state = PlayerOverlayState {

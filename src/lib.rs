@@ -32,6 +32,10 @@ impl Player {
             inner: CustomPlayer::new(DefaultOverlay {}, ctx, input_path),
         }
     }
+
+    pub fn render(&mut self, ui: &mut Ui) -> Response {
+        self.inner.render(ui)
+    }
 }
 
 impl PlayerControls for Player {
