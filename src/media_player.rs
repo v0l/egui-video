@@ -512,7 +512,7 @@ impl MediaPlayerThread {
             {
                 match self.decoder.decode_pkt(pkt) {
                     Ok(frames) => {
-                        for frame in frames {
+                        for (frame, stream) in frames {
                             let mut frame = self.process_frame(frame, stream)?;
                             av_frame_free(&mut frame);
                         }
