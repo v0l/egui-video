@@ -495,12 +495,18 @@ impl MediaPlayerThread {
 
             // read frames
             let (mut pkt, stream) = self.demuxer.get_packet()?;
+
+            // skip if not decoding this stream
             if !stream.is_null() && !pkt.is_null() && !probed.is_best_stream(stream) {
                 av_packet_free(&mut pkt);
                 continue;
             }
 
-            let media_type = (*(*stream).codecpar).codec_type;
+            let media_type = if !stream.is_null() {
+                (*(*stream).codecpar).codec_type
+            } else {
+                AVMediaType::AVMEDIA_TYPE_VIDEO
+            };
             if media_type == AVMediaType::AVMEDIA_TYPE_VIDEO
                 || media_type == AVMediaType::AVMEDIA_TYPE_AUDIO
             {
