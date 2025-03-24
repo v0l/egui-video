@@ -4,6 +4,7 @@ use nom::combinator::{all_consuming, map, rest};
 use nom::error::Error;
 use nom::sequence::delimited;
 use nom::IResult;
+use nom::Parser;
 use std::default::Default;
 
 pub enum TagKind {
@@ -27,7 +28,8 @@ fn i(input: &str) -> IResult<&str, Tagged> {
             content: t,
         }),
         tag("</i>"),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn b(input: &str) -> IResult<&str, Tagged> {
@@ -38,7 +40,8 @@ fn b(input: &str) -> IResult<&str, Tagged> {
             content: t,
         }),
         tag("</b>"),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn u(input: &str) -> IResult<&str, Tagged> {
@@ -49,7 +52,8 @@ fn u(input: &str) -> IResult<&str, Tagged> {
             content: t,
         }),
         tag("</u>"),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn s(input: &str) -> IResult<&str, Tagged> {
@@ -60,7 +64,8 @@ fn s(input: &str) -> IResult<&str, Tagged> {
             content: t,
         }),
         tag("</s>"),
-    )(input)
+    )
+    .parse(input)
 }
 
 fn any(input: &str) -> IResult<&str, Tagged<'_>, Error<&str>> {
@@ -73,7 +78,8 @@ fn any(input: &str) -> IResult<&str, Tagged<'_>, Error<&str>> {
             kind: TagKind::Unknown,
             content: r,
         }),
-    )))(input)
+    )))
+    .parse(input)
 }
 
 pub(crate) fn parse_srt_subtitle(input: &str) -> Result<super::Subtitle, anyhow::Error> {

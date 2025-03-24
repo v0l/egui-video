@@ -27,10 +27,7 @@ impl HlsStream {
     }
 
     pub fn load(&mut self) -> Result<()> {
-        let rsp = ureq::get(&self.url).call()?;
-
-        let mut bytes = Vec::new();
-        rsp.into_reader().read_to_end(&mut bytes)?;
+        let bytes = ureq::get(&self.url).call()?.body_mut().read_to_vec()?;
 
         let parsed = m3u8_rs::parse_playlist(&bytes);
         match parsed {
@@ -131,10 +128,10 @@ impl VariantReader {
     }
 
     fn load_playlist(&self) -> Result<MediaPlaylist> {
-        let req = ureq::get(&self.variant.uri).call()?;
-
-        let mut bytes = Vec::new();
-        req.into_reader().read_to_end(&mut bytes)?;
+        let bytes = ureq::get(&self.variant.uri)
+            .call()?
+            .body_mut()
+            .read_to_vec()?;
         let parsed = m3u8_rs::parse_playlist(&bytes);
         match parsed {
             Ok((_, playlist)) => match playlist {
@@ -173,7 +170,7 @@ impl VariantReader {
             let req = ureq::get(u.as_ref()).call()?;
 
             self.prev.insert(next_seg.uri.clone(), next_seg.clone());
-            Ok(Some(req.into_reader()))
+            Ok(Some(Box::new(req.into_body().into_reader())))
         } else {
             Ok(None)
         }

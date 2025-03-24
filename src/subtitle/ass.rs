@@ -8,7 +8,7 @@ use nom::error::context;
 use nom::multi::{many0, separated_list0};
 use nom::number::complete::double;
 use nom::sequence::{delimited, pair, preceded, tuple};
-use nom::IResult;
+use nom::{IResult, Parser};
 
 use super::{FadeEffect, Subtitle};
 
@@ -21,7 +21,7 @@ enum SubtitleField<'a> {
 }
 
 fn num_list(i: &str) -> IResult<&str, Vec<f64>> {
-    delimited(char('('), separated_list0(char(','), double), char(')'))(i)
+    delimited(char('('), separated_list0(char(','), double), char(')')).parse(i)
 }
 
 fn tuple_int_2(v: Vec<f64>) -> Result<(i64, i64)> {
@@ -46,7 +46,8 @@ fn fad(i: &str) -> IResult<&str, SubtitleField> {
             });
             fade_effect
         }),
-    )(i)
+    )
+    .parse(i)
 }
 
 fn t(i: &str) -> IResult<&str, SubtitleField> {
@@ -59,7 +60,8 @@ fn t(i: &str) -> IResult<&str, SubtitleField> {
             }),
             char(')'),
         ),
-    )(i)
+    )
+    .parse(i)
 }
 
 fn an(i: &str) -> IResult<&str, SubtitleField> {
@@ -79,7 +81,8 @@ fn an(i: &str) -> IResult<&str, SubtitleField> {
             Ok(9) => Ok(SubtitleField::Alignment(Align2::RIGHT_TOP)),
             _ => bail!("invalid alignment"),
         }),
-    )(i)
+    )
+    .parse(i)
 }
 
 fn pos(i: &str) -> IResult<&str, SubtitleField> {
@@ -88,7 +91,8 @@ fn pos(i: &str) -> IResult<&str, SubtitleField> {
         map(map_res(num_list, tuple_float_2), |p| {
             SubtitleField::Position(Pos2::new(p.0 as f32, p.1 as f32))
         }),
-    )(i)
+    )
+    .parse(i)
 }
 
 // color parsing credit: example on https://github.com/rust-bakery/nom/tree/main
@@ -99,7 +103,7 @@ fn is_hex_digit(c: char) -> bool {
     c.is_ascii_hexdigit()
 }
 fn hex_primary(i: &str) -> IResult<&str, u8> {
-    map_res(take_while_m_n(2, 2, is_hex_digit), from_hex)(i)
+    map_res(take_while_m_n(2, 2, is_hex_digit), from_hex).parse(i)
 }
 fn hex_to_color32(i: &str) -> IResult<&str, Color32> {
     let (i, (blue, green, red)) = tuple((hex_primary, hex_primary, hex_primary))(i)?;
@@ -110,20 +114,23 @@ fn c(i: &str) -> IResult<&str, SubtitleField> {
         alt((tag(r"\c&H"), tag(r"\1c&H"))),
         map(hex_to_color32, SubtitleField::PrimaryFill),
         tag("&"),
-    )(i)
+    )
+    .parse(i)
 }
 fn undefined(i: &str) -> IResult<&str, SubtitleField> {
     map(
         preceded(char('\\'), take_till(|c| "}\\".contains(c))),
         SubtitleField::Undefined,
-    )(i)
+    )
+    .parse(i)
 }
 fn parse_style(i: &str) -> IResult<&str, Subtitle> {
     let (i, subtitle_style_components) = delimited(
         char('{'),
         many0(alt((t, fad, an, pos, c, undefined))),
         tuple((take_until("}"), char('}'))),
-    )(i)?;
+    )
+    .parse(i)?;
 
     let mut subtitle = Subtitle::default();
 
@@ -140,7 +147,8 @@ fn parse_style(i: &str) -> IResult<&str, Subtitle> {
 }
 
 fn text_field(i: &str) -> IResult<&str, Subtitle> {
-    let (i, (subtitle, subtitle_text)) = preceded(opt_comma, pair(opt(parse_style), rest))(i)?;
+    let (i, (subtitle, subtitle_text)) =
+        preceded(opt_comma, pair(opt(parse_style), rest)).parse(i)?;
     let mut subtitle = subtitle.unwrap_or_default();
     subtitle.text = subtitle_text.replace(r"\N", "\n");
     Ok((i, subtitle))
@@ -153,20 +161,20 @@ fn comma(i: &str) -> IResult<&str, char> {
     char(',')(i)
 }
 fn opt_comma(i: &str) -> IResult<&str, Option<char>> {
-    opt(comma)(i)
+    opt(comma).parse(i)
 }
 
 fn string_field(i: &str) -> IResult<&str, Option<String>> {
-    preceded(opt_comma, map(opt(not_comma), |s| s.map(String::from)))(i)
+    preceded(opt_comma, map(opt(not_comma), |s| s.map(String::from))).parse(i)
 }
 
 fn num_field(i: &str) -> IResult<&str, i32> {
-    preceded(opt_comma, map_res(digit0, str::parse))(i)
+    preceded(opt_comma, map_res(digit0, str::parse)).parse(i)
 }
 
 pub(crate) fn parse_ass_subtitle(i: &str) -> Result<Subtitle> {
     let (_i, (_layer, _start, _style, _name, _margin_l, _margin_r, _margin_v, _effect, subtitle)) =
-        tuple((
+        (
             context("layer", num_field),
             context("start", num_field),
             context("style", string_field),
@@ -176,8 +184,9 @@ pub(crate) fn parse_ass_subtitle(i: &str) -> Result<Subtitle> {
             context("margin_v", num_field),
             context("effect", string_field),
             context("style override + text", text_field),
-        ))(i)
-        .map_err(|e| anyhow!(format!("subtitle parse failed: {e}")))?;
+        )
+            .parse(i)
+            .map_err(|e| anyhow!(format!("subtitle parse failed: {e}")))?;
 
     Ok(subtitle)
 }

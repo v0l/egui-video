@@ -9,8 +9,8 @@ use egui::load::SizedTexture;
 use egui::text::LayoutJob;
 use egui::{
     pos2, vec2, Align2, Color32, ColorImage, Event, FontId, Image, Key, Rect, Response, Sense,
-    Stroke, TextFormat, TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand, ViewportId,
-    Widget,
+    Stroke, StrokeKind, TextFormat, TextureHandle, TextureOptions, Ui, Vec2, ViewportCommand,
+    ViewportId, Widget,
 };
 use egui_inbox::{UiInbox, UiInboxSender};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
@@ -550,7 +550,7 @@ impl<T> CustomPlayer<T> {
     fn render_frame_at(&self, ui: &mut Ui, rect: Rect) -> Response {
         let video_size = self.video_frame_size(rect);
         ui.painter()
-            .rect(rect, 0.0, Color32::BLACK, Stroke::default());
+            .rect(rect, 0.0, Color32::BLACK, Stroke::NONE, StrokeKind::Middle);
         ui.put(rect, self.generate_frame_image(video_size))
     }
 

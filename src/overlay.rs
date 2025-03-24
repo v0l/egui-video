@@ -1,6 +1,6 @@
 use crate::{PlayerControls, PlayerOverlay, PlayerOverlayState, PlayerState};
 use egui::{
-    vec2, Align2, Color32, FontId, Rect, Response, Rounding, Sense, Shadow, Spinner, Ui, Vec2,
+    vec2, Align2, Color32, CornerRadius, FontId, Rect, Response, Sense, Shadow, Spinner, Ui, Vec2,
 };
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
 use ffmpeg_rs_raw::format_time;
@@ -72,14 +72,14 @@ impl PlayerOverlay for DefaultOverlay {
 
         if currently_seeking {
             let seek_indicator_shadow = Shadow {
-                offset: vec2(10.0, 20.0),
-                blur: 15.0,
-                spread: 0.0,
+                offset: [10, 20],
+                blur: 15,
+                spread: 0,
                 color: Color32::from_black_alpha(96).linear_multiply(seek_indicator_anim),
             };
             let spinner_size = 20. * seek_indicator_anim;
             ui.painter()
-                .add(seek_indicator_shadow.as_shape(frame_response.rect, Rounding::ZERO));
+                .add(seek_indicator_shadow.as_shape(frame_response.rect, CornerRadius::ZERO));
             ui.put(
                 Rect::from_center_size(frame_response.rect.center(), Vec2::splat(spinner_size)),
                 Spinner::new().size(spinner_size),
@@ -152,9 +152,9 @@ impl PlayerOverlay for DefaultOverlay {
         duration_text_font_id.size = 14.;
 
         let shadow = Shadow {
-            offset: vec2(10.0, 20.0),
-            blur: 15.0,
-            spread: 0.0,
+            offset: [10, 20],
+            blur: 15,
+            spread: 0,
             color: Color32::from_black_alpha(25).linear_multiply(seekbar_anim_frac),
         };
 
@@ -165,15 +165,15 @@ impl PlayerOverlay for DefaultOverlay {
         let seekbar_color = Color32::WHITE.linear_multiply(seekbar_anim_frac);
 
         ui.painter()
-            .add(shadow.as_shape(shadow_rect, Rounding::ZERO));
+            .add(shadow.as_shape(shadow_rect, CornerRadius::ZERO));
 
         ui.painter().rect_filled(
             fullseekbar_rect,
-            Rounding::ZERO,
+            CornerRadius::ZERO,
             fullseekbar_color.linear_multiply(0.5),
         );
         ui.painter()
-            .rect_filled(seekbar_rect, Rounding::ZERO, seekbar_color);
+            .rect_filled(seekbar_rect, CornerRadius::ZERO, seekbar_color);
         ui.painter().text(
             pause_icon_pos,
             Align2::LEFT_BOTTOM,
@@ -257,7 +257,7 @@ impl PlayerOverlay for DefaultOverlay {
                     Color32::from_black_alpha(contraster_alpha).linear_multiply(stream_anim_frac);
 
                 ui.painter()
-                    .rect_filled(background_rect, Rounding::same(5.), background_color);
+                    .rect_filled(background_rect, CornerRadius::same(5), background_color);
 
                 if ui.rect_contains_pointer(background_rect.expand(5.)) {
                     stream_info_hovered = true;
@@ -354,11 +354,14 @@ impl PlayerOverlay for DefaultOverlay {
         sound_bar_rect
             .set_top(sound_bar_rect.bottom() - (sound_bar_rect.height() * audio_volume_frac));
 
-        ui.painter()
-            .rect_filled(sound_slider_rect, Rounding::same(5.), sound_slider_bg_color);
+        ui.painter().rect_filled(
+            sound_slider_rect,
+            CornerRadius::same(5),
+            sound_slider_bg_color,
+        );
 
         ui.painter()
-            .rect_filled(sound_bar_rect, Rounding::same(5.), sound_bar_color);
+            .rect_filled(sound_bar_rect, CornerRadius::same(5), sound_bar_color);
         let sound_slider_resp = ui.interact(
             sound_slider_rect,
             frame_response.id.with("sound_slider_sense"),
