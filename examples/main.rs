@@ -1,14 +1,6 @@
 use eframe::NativeOptions;
-use egui::{CentralPanel, Response, TextEdit, Ui, ViewportBuilder, Widget};
-use egui_video::{AudioDevice, PlaybackInfo, PlaybackUpdate, Player, PlayerOverlay};
-
-struct EmptyOverlay;
-
-impl PlayerOverlay for EmptyOverlay {
-    fn show(&self, ui: &mut Ui, frame_response: &Response, p: &PlaybackInfo) -> PlaybackUpdate {
-        Default::default()
-    }
-}
+use egui::{CentralPanel, TextEdit, ViewportBuilder, Widget};
+use egui_video::{DefaultOverlay, Player};
 
 fn main() {
     env_logger::init();
@@ -19,8 +11,7 @@ fn main() {
 }
 
 struct App {
-    audio_device: AudioDevice,
-    player: Option<Player<EmptyOverlay>>,
+    player: Option<Player<DefaultOverlay>>,
 
     media_path: String,
 }
@@ -28,9 +19,8 @@ struct App {
 impl Default for App {
     fn default() -> Self {
         Self {
-            audio_device: AudioDevice::new().unwrap(),
             media_path:
-                "https://api-core.zap.stream/537a365c-f1ec-44ac-af10-22d14a7319fb/hls/live.m3u8"
+                "/home/kieran/Downloads/www.UIndex.org    -    Fallout S02E04 The the Snow 2160p AMZN WEB-DL DD 5 1 Atmos H 265-playWEB.mkv"
                     .to_string(),
             player: None,
         }
@@ -43,9 +33,10 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!self.media_path.is_empty(), |ui| {
                     if ui.button("load").clicked() {
-                        if let Ok(p) =
-                            Player::new(EmptyOverlay, ctx, &self.media_path.replace("\"", ""))
+                        if let Ok(mut p) =
+                            Player::new(DefaultOverlay, ctx, &self.media_path.replace("\"", ""))
                         {
+                            p.enable_keybinds(true);
                             self.player = Some(p);
                         }
                     }

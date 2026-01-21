@@ -1,14 +1,14 @@
-use crate::{PlaybackInfo, PlaybackUpdate, PlayerOverlay, PlayerState};
+use crate::stream::StreamType;
+use crate::{PlaybackInfo, PlaybackUpdate, PlayerOverlay, PlayerState, format_time};
 use egui::{
     Align2, Color32, CornerRadius, FontId, Rect, Response, Sense, Shadow, Spinner, Ui, Vec2, vec2,
 };
-use ffmpeg_rs_raw::ffmpeg_sys_the_third::AVMediaType;
-use ffmpeg_rs_raw::format_time;
 
+/// Basic player overlay impl
 pub struct DefaultOverlay;
 
 impl PlayerOverlay for DefaultOverlay {
-    fn show(&self, ui: &mut Ui, frame_response: &Response, p: PlaybackInfo) -> PlaybackUpdate {
+    fn show(&self, ui: &mut Ui, frame_response: &Response, p: &PlaybackInfo) -> PlaybackUpdate {
         let hovered = ui.rect_contains_pointer(frame_response.rect);
         let currently_seeking = matches!(p.state, PlayerState::Seeking);
         let is_stopped = matches!(p.state, PlayerState::Stopped);
@@ -236,10 +236,10 @@ impl PlayerOverlay for DefaultOverlay {
                 .ctx()
                 .memory_mut(|m| *m.data.get_temp_mut_or_default(stream_anim_id));
 
-            let mut draw_row = |stream_type: AVMediaType| {
+            let mut draw_row = |stream_type: StreamType| {
                 let text = match stream_type {
-                    AVMediaType::AVMEDIA_TYPE_AUDIO => format!("{} {}/{}", sound_icon, 1, 1),
-                    AVMediaType::AVMEDIA_TYPE_SUBTITLE => format!("{} {}/{}", subtitle_icon, 1, 1),
+                    StreamType::Audio => format!("{} {}/{}", sound_icon, 1, 1),
+                    StreamType::Subtitle => format!("{} {}/{}", subtitle_icon, 1, 1),
                     _ => unreachable!(),
                 };
 
@@ -286,10 +286,10 @@ impl PlayerOverlay for DefaultOverlay {
 
             if stream_anim_frac > 0. {
                 if is_audio_cyclable {
-                    draw_row(AVMediaType::AVMEDIA_TYPE_AUDIO);
+                    draw_row(StreamType::Audio);
                 }
                 if is_subtitle_cyclable {
-                    draw_row(AVMediaType::AVMEDIA_TYPE_SUBTITLE);
+                    draw_row(StreamType::Subtitle);
                 }
             }
 

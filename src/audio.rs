@@ -5,7 +5,7 @@ use anyhow::bail;
 use bungee_sys::BungeeStream;
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{SampleFormat, Stream};
-use log::info;
+use log::{info, trace};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU16, Ordering};
 use std::sync::mpsc::Receiver;
@@ -13,6 +13,13 @@ use std::sync::{Arc, mpsc};
 
 /// The playback device. Needs to be initialized (and kept alive!) for use by a [`Player`].
 pub struct AudioDevice(pub(crate) cpal::Device);
+
+pub struct AudioDeviceHandle {
+    device: AudioDevice,
+    stream: Stream,
+}
+
+impl crate::AudioDevice for AudioDeviceHandle {}
 
 impl AudioDevice {
     pub fn from_device(device: cpal::Device) -> Self {
@@ -41,7 +48,7 @@ impl AudioDevice {
         _speed: Arc<AtomicI16>,
         position: Arc<AtomicI64>,
         rx: Receiver<AudioSamples>,
-    ) -> Result<(AudioDevice, Stream)> {
+    ) -> Result<AudioDeviceHandle> {
         let device = AudioDevice::new()?;
         let cfg = device.0.default_output_config()?;
         info!(
@@ -78,6 +85,7 @@ impl AudioDevice {
                             simple_queue.extend(m.data);
                         }
                         Err(mpsc::TryRecvError::Empty) => {
+                            trace!("Audio underrun!");
                             continue;
                         }
                         Err(_) => {
@@ -86,11 +94,6 @@ impl AudioDevice {
                     }
                 }
                 if simple_queue.len() >= dst.len() {
-                    info!(
-                        "Audio samples out={}, buf={}",
-                        dst.len(),
-                        simple_queue.len()
-                    );
                     let drain_samples = simple_queue.drain(..dst.len()).collect::<Vec<_>>();
                     dst.copy_from_slice(&drain_samples);
                 }
@@ -101,7 +104,7 @@ impl AudioDevice {
             None,
         )?;
 
-        Ok((device, stream))
+        Ok(AudioDeviceHandle { device, stream })
     }
 }
 

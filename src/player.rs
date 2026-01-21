@@ -1,20 +1,21 @@
-use crate::stream::{DecoderInfo, MediaDecoder, SubtitlePacket, VideoFrame};
+use crate::stream::{
+    AudioSamples, DecoderInfo, MediaDecoder, StreamInfo, SubtitlePacket, VideoFrame,
+};
 #[cfg(feature = "subtitles")]
 use crate::subtitle::Subtitle;
-use crate::AudioDevice;
+use crate::{AudioDevice, NoAudioDevice, format_time};
 use anyhow::Result;
-use cpal::traits::DeviceTrait;
-use cpal::Stream;
 use egui::load::SizedTexture;
+use egui::text::LayoutJob;
 use egui::{
     Align2, Color32, ColorImage, Event, FontId, Image, Key, Rect, Response, Sense, Stroke,
-    StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, Widget, pos2, vec2,
+    StrokeKind, TextFormat, TextureHandle, TextureOptions, Ui, Vec2, Widget, pos2, vec2,
 };
-use log::trace;
+use log::{info, trace};
 use std::ops::Add;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU16, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(not(feature = "subtitles"))]
@@ -22,6 +23,7 @@ struct Subtitle;
 
 /// Generic overlay for player controls
 pub trait PlayerOverlay: Send {
+    /// Show the overlay
     fn show(&self, ui: &mut Ui, frame_response: &Response, p: &PlaybackInfo) -> PlaybackUpdate;
 }
 
@@ -60,6 +62,20 @@ pub struct PlaybackUpdate {
     pub set_debug: Option<bool>,
 }
 
+impl PlaybackUpdate {
+    /// True if any state changes are requested
+    pub fn any(&self) -> bool {
+        self.set_state.is_some()
+            || self.set_volume.is_some()
+            || self.set_seek.is_some()
+            || self.set_muted.is_some()
+            || self.set_playback_speed.is_some()
+            || self.set_looping.is_some()
+            || self.set_fullscreen.is_some()
+            || self.set_debug.is_some()
+    }
+}
+
 /// The [`Player`] processes and controls streams of video/audio.
 /// This is what you use to show a video file.
 /// Initialize once, and use the [`Player::ui`] or [`Player::ui_at()`] functions to show the playback.
@@ -67,6 +83,7 @@ pub struct Player<T> {
     overlay: T,
     state: Arc<AtomicU8>,
     volume: Arc<AtomicU16>,
+    muted: Arc<AtomicBool>,
     playback_speed: Arc<AtomicI16>,
     debug: bool,
 
@@ -99,7 +116,7 @@ pub struct Player<T> {
 
     ctx: egui::Context,
     input_path: String,
-    audio: Option<(AudioDevice, Stream)>,
+    audio: Box<dyn AudioDevice>,
     subtitle: Option<Subtitle>,
 
     /// Media stream decoder thread
@@ -160,13 +177,6 @@ where
         self.frame_instant = Instant::now();
     }
 
-    /// The current presentation time
-    fn current_pts(&self) -> f64 {
-        let now = Instant::now();
-        let diff = now.duration_since(self.frame_instant).as_secs_f64();
-        self.frame_pts + diff
-    }
-
     fn request_repaint_for_next_frame(&self) {
         let now = Instant::now();
         let frame_duration = self.frame_pts_end - self.frame_pts;
@@ -203,6 +213,11 @@ where
     /// Instant when the current frame ends
     fn frame_end_instant(&self) -> Instant {
         self.frame_instant.add(self.frame_duration())
+    }
+
+    /// Enable/Disable built-in keybind controls
+    pub fn enable_keybinds(&mut self, v: bool) {
+        self.key_binds = v;
     }
 
     /// Handle key input
@@ -265,19 +280,27 @@ where
     }
 
     fn process_state(&mut self) {
-        if let Ok(md) = self.rx_metadata.try_recv() {
+        let current_state = PlayerState::from(self.state.load(Ordering::Relaxed));
+        if self.stream_info.is_none()
+            && let Ok(md) = self.rx_metadata.try_recv()
+        {
             self.stream_info.replace(md);
+            if current_state != PlayerState::Playing {
+                self.state
+                    .store(PlayerState::Playing as _, Ordering::Relaxed);
+            }
         }
 
-        if self.state.load(Ordering::Relaxed) == PlayerState::Stopped as u8 {
+        if current_state == PlayerState::Stopped {
             // nothing to do, playback is stopped
             return;
         }
 
         //self.media_player.set_target_size(size);
-        let current_pts = self.frame_pts + self.frame_instant.elapsed().as_secs_f64();
-        self.current_pts
-            .store((current_pts / 1000.0) as _, Ordering::Relaxed);
+        let duration_since_frame_start = self.frame_instant.elapsed().as_secs_f64();
+        let current_pts = self.frame_pts + duration_since_frame_start;
+        let current_pts = (current_pts * 1000.0) as _;
+        self.current_pts.store(current_pts, Ordering::Relaxed);
 
         // check if we should load the next video frame
         if !self.check_load_frame() {
@@ -317,11 +340,7 @@ where
     /// Exact size of the video frame inside a given [Rect]
     fn video_frame_size(&self, rect: Rect) -> Vec2 {
         if self.maintain_aspect {
-            let v_index = self.media_player.video_stream_index.load(Ordering::Relaxed);
-            let bv = self
-                .stream_info
-                .as_ref()
-                .and_then(|s| s.streams.iter().find(|v| v.index == v_index as _));
+            let bv = self.current_video_stream();
             let video_size = bv
                 .map(|v| vec2(v.width as f32, v.height as f32))
                 .unwrap_or(rect.size());
@@ -360,120 +379,135 @@ where
         }
     }
 
-    // fn render_debug(&mut self, ui: &mut Ui, frame_response: &Response) {
-    //     let painter = ui.painter();
-    //
-    //     const PADDING: f32 = 5.0;
-    //     let vec_padding = vec2(PADDING, PADDING);
-    //     let job = self.debug_inner(frame_response.rect);
-    //     let galley = painter.layout_job(job);
-    //     let mut bg_pos = galley
-    //         .rect
-    //         .translate(frame_response.rect.min.to_vec2() + vec_padding);
-    //     bg_pos.max += vec_padding * 2.0;
-    //     painter.rect_filled(bg_pos, PADDING, Color32::from_black_alpha(150));
-    //     painter.galley(bg_pos.min + vec_padding, galley, Color32::PLACEHOLDER);
-    // }
+    fn render_debug(&mut self, ui: &mut Ui, frame_response: &Response, p: &PlaybackInfo) {
+        let painter = ui.painter();
+
+        const PADDING: f32 = 5.0;
+        let vec_padding = vec2(PADDING, PADDING);
+        let job = self.debug_inner(frame_response.rect, p);
+        let galley = painter.layout_job(job);
+        let mut bg_pos = galley
+            .rect
+            .translate(frame_response.rect.min.to_vec2() + vec_padding);
+        bg_pos.max += vec_padding * 2.0;
+        painter.rect_filled(bg_pos, PADDING, Color32::from_black_alpha(150));
+        painter.galley(bg_pos.min + vec_padding, galley, Color32::PLACEHOLDER);
+    }
 
     fn show_osd(&mut self, msg: &str) {
         self.osd = Some(msg.to_string());
         self.osd_end = Instant::now() + Duration::from_secs(2);
     }
 
-    // fn debug_inner(&mut self, frame_response: Rect) -> LayoutJob {
-    //     let v_pts = self.elapsed();
-    //     let a_pts = self
-    //         .audio
-    //         .as_ref()
-    //         .map(|a| a.buffer.lock().map(|b| b.audio_pos).unwrap_or(0.0))
-    //         .unwrap_or(0.0);
-    //     let font = TextFormat::simple(FontId::monospace(11.), Color32::WHITE);
-    //
-    //     let mut layout = LayoutJob::default();
-    //     let buffer = self.pts_to_sec(self.media_player.buffer_size());
-    //     layout.append(
-    //         &format!(
-    //             "sync: v:{:.3}s, a:{:.3}s, a-sync:{:.3}s, buffer: {:.3}s",
-    //             v_pts,
-    //             a_pts,
-    //             a_pts - v_pts,
-    //             buffer
-    //         ),
-    //         0.0,
-    //         font.clone(),
-    //     );
-    //
-    //     let video_size = self.video_frame_size(frame_response);
-    //     layout.append(
-    //         &format!(
-    //             "\nplayback: {:.2} fps ({:.2}x), volume={:.0}%, resolution={}x{}",
-    //             self.avg_fps,
-    //             self.avg_fps / self.framerate(),
-    //             100.0 * self.volume(),
-    //             video_size.x,
-    //             video_size.y
-    //         ),
-    //         0.0,
-    //         font.clone(),
-    //     );
-    //
-    //     if let Some(info) = self.info.as_ref() {
-    //         let bitrate_str = if info.bitrate > 1_000_000 {
-    //             format!("{:.1}M", info.bitrate as f32 / 1_000_000.0)
-    //         } else if info.bitrate > 1_000 {
-    //             format!("{:.1}k", info.bitrate as f32 / 1_000.0)
-    //         } else {
-    //             info.bitrate.to_string()
-    //         };
-    //
-    //         layout.append(
-    //             &format!(
-    //                 "\nduration: {}, bitrate: {}",
-    //                 format_time(info.duration),
-    //                 bitrate_str
-    //             ),
-    //             0.0,
-    //             font.clone(),
-    //         );
-    //
-    //         fn print_chan(
-    //             layout: &mut LayoutJob,
-    //             font: TextFormat,
-    //             chan: Option<&StreamInfo>,
-    //             decoders: &Vec<DecoderInfo>,
-    //         ) {
-    //             if let Some(c) = chan {
-    //                 layout.append(&format!("\n{}", c), 0.0, font.clone());
-    //                 if let Some(decoder) = decoders.iter().find(|d| d.index == c.index) {
-    //                     layout.append(&format!("\n\tdecoder={}", decoder.codec), 0.0, font.clone());
-    //                 }
-    //             }
-    //         }
-    //         print_chan(&mut layout, font.clone(), info.best_video(), &self.decoders);
-    //         print_chan(&mut layout, font.clone(), info.best_audio(), &self.decoders);
-    //         print_chan(
-    //             &mut layout,
-    //             font.clone(),
-    //             info.best_subtitle(),
-    //             &self.decoders,
-    //         );
-    //     }
-    //
-    //     layout
-    // }
+    /// Get the currently playing video stream info
+    fn current_video_stream(&self) -> Option<&StreamInfo> {
+        if let Some(i) = self.stream_info.as_ref() {
+            let v_index = self.media_player.video_stream_index.load(Ordering::Relaxed);
+            i.streams.iter().find(|s| s.index == v_index as _)
+        } else {
+            None
+        }
+    }
+
+    /// Get the currently playing audio stream info
+    fn current_audio_stream(&self) -> Option<&StreamInfo> {
+        if let Some(i) = self.stream_info.as_ref() {
+            let v_index = self.media_player.audio_stream_index.load(Ordering::Relaxed);
+            i.streams.iter().find(|s| s.index == v_index as _)
+        } else {
+            None
+        }
+    }
+
+    /// Get the currently playing subtitle stream info
+    fn current_subtitle_stream(&self) -> Option<&StreamInfo> {
+        if let Some(i) = self.stream_info.as_ref() {
+            let v_index = self
+                .media_player
+                .subtitle_stream_index
+                .load(Ordering::Relaxed);
+            i.streams.iter().find(|s| s.index == v_index as _)
+        } else {
+            None
+        }
+    }
+
+    fn debug_inner(&mut self, frame_response: Rect, p: &PlaybackInfo) -> LayoutJob {
+        let font = TextFormat::simple(FontId::monospace(11.), Color32::WHITE);
+
+        let mut layout = LayoutJob::default();
+        // layout.append(
+        //     &format!(
+        //         "sync: v:{:.3}s, a:{:.3}s, a-sync:{:.3}s, buffer: {:.3}s",
+        //         v_pts,
+        //         a_pts,
+        //         a_pts - v_pts,
+        //         buffer
+        //     ),
+        //     0.0,
+        //     font.clone(),
+        // );
+
+        let video_stream = self.current_video_stream();
+        let video_size = self.video_frame_size(frame_response);
+        layout.append(
+            &format!(
+                "\nplayback: {:.2} fps ({:.2}x), volume={:.0}%, resolution={}x{}",
+                self.avg_fps,
+                self.avg_fps / video_stream.map(|s| s.fps).unwrap_or(1.0),
+                100.0 * p.volume,
+                video_size.x,
+                video_size.y
+            ),
+            0.0,
+            font.clone(),
+        );
+
+        if let Some(info) = self.stream_info.as_ref() {
+            let bitrate_str = if info.bitrate > 1_000_000 {
+                format!("{:.1}M", info.bitrate as f32 / 1_000_000.0)
+            } else if info.bitrate > 1_000 {
+                format!("{:.1}k", info.bitrate as f32 / 1_000.0)
+            } else {
+                info.bitrate.to_string()
+            };
+
+            layout.append(
+                &format!(
+                    "\nduration: {}, bitrate: {}",
+                    format_time(info.duration),
+                    bitrate_str
+                ),
+                0.0,
+                font.clone(),
+            );
+
+            fn print_chan(layout: &mut LayoutJob, font: TextFormat, chan: Option<&StreamInfo>) {
+                if let Some(c) = chan {
+                    layout.append(&format!("\n  {}", c), 0.0, font.clone());
+                }
+            }
+            print_chan(&mut layout, font.clone(), video_stream);
+            print_chan(&mut layout, font.clone(), self.current_audio_stream());
+            print_chan(&mut layout, font.clone(), self.current_subtitle_stream());
+        }
+
+        layout
+    }
 
     /// Create a new [`Player`].
     pub fn new(overlay: T, ctx: &egui::Context, input_path: &str) -> Result<Self> {
         // volume arc
         let vol = Arc::new(AtomicU16::new(u16::MAX));
-        let state = Arc::new(AtomicU8::new(1));
+        let state = Arc::new(AtomicU8::new(PlayerState::Stopped as _));
         let speed = Arc::new(AtomicI16::new(100));
         let mute = Arc::new(AtomicBool::new(true));
         let pts = Arc::new(AtomicI64::new(0));
 
         let (media_player, streams) =
             MediaDecoder::new(input_path).expect("Failed to create media playback");
-        let audio = AudioDevice::open_default_audio_stream(
+
+        let audio = Self::open_audio(
             vol.clone(),
             mute.clone(),
             state.clone(),
@@ -503,7 +537,7 @@ where
             frame_pts_end: 0.0,
             current_pts: pts,
             ctx: ctx.clone(),
-            audio: Some(audio),
+            audio,
             subtitle: None,
             media_player,
             rx_metadata: streams.metadata,
@@ -520,7 +554,26 @@ where
             osd_end: Instant::now(),
             stream_info: None,
             rx_subtitle: streams.subtitle,
+            muted: mute,
         })
+    }
+
+    #[allow(unused)]
+    fn open_audio(
+        volume: Arc<AtomicU16>,
+        mute: Arc<AtomicBool>,
+        state: Arc<AtomicU8>,
+        speed: Arc<AtomicI16>,
+        position: Arc<AtomicI64>,
+        rx: Receiver<AudioSamples>,
+    ) -> Result<Box<dyn AudioDevice>> {
+        #[cfg(feature = "audio")]
+        return Ok(Box::new(
+            crate::audio::AudioDevice::open_default_audio_stream(
+                volume, mute, state, speed, position, rx,
+            )?,
+        ));
+        Ok(Box::new(NoAudioDevice::new(rx)))
     }
 }
 
@@ -543,14 +596,14 @@ where
 
         let state = PlaybackInfo {
             state: self.state.load(Ordering::Relaxed).into(),
-            duration: 0.0,
-            elapsed: 0.0,
-            volume: 0.0,
-            muted: false,
-            playback_speed: 1.0,
-            looping: false,
-            fullscreen: false,
-            debug: false,
+            duration: self.stream_info.as_ref().map(|i| i.duration).unwrap_or(0.0),
+            elapsed: (self.current_pts.load(Ordering::Relaxed) as f64 / 1000.0) as _,
+            volume: self.volume.load(Ordering::Relaxed) as f32 / u16::MAX as f32,
+            muted: self.muted.load(Ordering::Relaxed),
+            playback_speed: self.playback_speed.load(Ordering::Relaxed) as f32 / i16::MAX as f32,
+            looping: self.media_player.looping.load(Ordering::Relaxed),
+            fullscreen: self.fullscreen,
+            debug: self.debug,
         };
         let upd = self.handle_keys(ui, &state);
         self.process_update(upd);
@@ -579,14 +632,43 @@ where
                 Color32::WHITE,
             );
         }
-        // if self.debug {
-        //     self.render_debug(ui, &frame_response);
-        // }
+        if self.debug {
+            self.render_debug(ui, &frame_response, &state);
+        }
         frame_response
     }
 
-    fn process_update(&mut self, _updates: PlaybackUpdate) {
+    fn process_update(&mut self, updates: PlaybackUpdate) {
         // TODO: change internal state
+        if updates.any() {
+            info!("State change: {:?}", updates);
+        }
+
+        if let Some(s) = updates.set_state {
+            self.state.store(s as _, Ordering::Relaxed);
+        }
+        if let Some(s) = updates.set_volume {
+            self.volume.store(s as _, Ordering::Relaxed);
+        }
+        if let Some(s) = updates.set_muted {
+            self.muted.store(s as _, Ordering::Relaxed);
+        }
+        if let Some(s) = updates.set_playback_speed {
+            self.playback_speed.store(s as _, Ordering::Relaxed);
+        }
+        if let Some(s) = updates.set_seek {
+            // TODO: make seeking
+        }
+        if let Some(s) = updates.set_looping {
+            self.media_player.looping.store(s as _, Ordering::Relaxed);
+        }
+        if let Some(s) = updates.set_fullscreen {
+            self.fullscreen = s;
+            // TODO: make fullscreen
+        }
+        if let Some(s) = updates.set_debug {
+            self.debug = s;
+        }
     }
 
     fn render_overlay(&mut self, ui: &mut Ui, frame: &Response, state: &PlaybackInfo) {

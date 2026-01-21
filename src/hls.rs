@@ -1,4 +1,3 @@
-use crate::ffmpeg_sys_the_third::{AVPacket, AVStream};
 use anyhow::Result;
 use ffmpeg_rs_raw::{AvPacketRef, Demuxer, DemuxerInfo};
 use itertools::Itertools;
@@ -198,36 +197,5 @@ impl Read for VariantReader {
             z += 1;
         }
         Ok(cpy)
-    }
-}
-
-pub trait DemuxerIsh {
-    fn probe_input(&mut self) -> Result<DemuxerInfo>;
-    fn get_packet(&mut self) -> Result<(Option<AvPacketRef>, *mut AVStream)>;
-}
-
-impl DemuxerIsh for HlsStream {
-    fn probe_input(&mut self) -> Result<DemuxerInfo> {
-        if self.playlist.is_none() {
-            self.load()?;
-        }
-
-        let demux = self.current_demuxer()?;
-        unsafe { demux.probe_input() }
-    }
-
-    fn get_packet(&mut self) -> Result<(Option<AvPacketRef>, *mut AVStream)> {
-        let demux = self.current_demuxer()?;
-        unsafe { demux.get_packet() }
-    }
-}
-
-impl DemuxerIsh for Demuxer {
-    fn probe_input(&mut self) -> Result<DemuxerInfo> {
-        unsafe { self.probe_input() }
-    }
-
-    fn get_packet(&mut self) -> Result<(Option<AvPacketRef>, *mut AVStream)> {
-        unsafe { self.get_packet() }
     }
 }
