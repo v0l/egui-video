@@ -1,8 +1,15 @@
-use cpal::traits::HostTrait;
-use cpal::{Stream, SupportedStreamConfig};
+use crate::PlayerState;
+use crate::stream::AudioSamples;
+use anyhow::Result;
+use anyhow::bail;
+use bungee_sys::{BungeeStream, BungeeStretcher};
+use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::{SampleFormat, Stream};
+use log::info;
 use std::collections::VecDeque;
-use std::sync::atomic::AtomicU8;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU16, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::{Arc, mpsc};
 
 /// The playback device. Needs to be initialized (and kept alive!) for use by a [`Player`].
 pub struct AudioDevice(pub(crate) cpal::Device);
@@ -13,64 +20,134 @@ impl AudioDevice {
     }
 
     /// Create a new [`AudioDevice`] from an existing [`cpal::Host`]. An [`AudioDevice`] is required for using audio.
-    pub fn from_subsystem(audio_sys: &cpal::Host) -> Result<AudioDevice, String> {
+    pub fn from_subsystem(audio_sys: &cpal::Host) -> Result<AudioDevice> {
         if let Some(dev) = audio_sys.default_output_device() {
             Ok(AudioDevice(dev))
         } else {
-            Err("No default audio device".to_owned())
+            bail!("No default audio device available");
         }
     }
 
     /// Create a new [`AudioDevice`]. Creates an [`cpal::Host`]. An [`AudioDevice`] is required for using audio.
-    pub fn new() -> Result<AudioDevice, String> {
+    pub fn new() -> Result<AudioDevice> {
         let host = cpal::default_host();
         Self::from_subsystem(&host)
     }
+
+    pub fn open_default_audio_stream(
+        volume: Arc<AtomicU16>,
+        mute: Arc<AtomicBool>,
+        state: Arc<AtomicU8>,
+        speed: Arc<AtomicI16>,
+        position: Arc<AtomicI64>,
+        rx: Receiver<AudioSamples>,
+    ) -> Result<(AudioDevice, Stream)> {
+        let device = AudioDevice::new()?;
+        let cfg = device.0.default_output_config()?;
+        info!(
+            "Default audio device config: {}Hz, {}ch, {:?}",
+            cfg.sample_rate(),
+            cfg.channels(),
+            cfg.sample_format()
+        );
+
+        let channels = cfg.channels() as u8;
+        let mut simple_queue = VecDeque::new();
+        let mut bungee_stream = BungeeWrapper::new(channels, cfg.sample_rate() as _)?;
+        let stream = device.0.build_output_stream_raw(
+            &cfg.config(),
+            SampleFormat::I32,
+            move |data: &mut cpal::Data, _info: &cpal::OutputCallbackInfo| {
+                if data.len() == 0 {
+                    return;
+                }
+                let dst: &mut [i32] = data.as_slice_mut().unwrap();
+                dst.fill(0);
+                let state = state.load(Ordering::Relaxed);
+                if state == PlayerState::Stopped as u8 || state == PlayerState::Paused as u8 {
+                    return;
+                }
+                let current_pts = position.load(Ordering::Relaxed) as f64 / 1000.0;
+                let mut frame_pts = current_pts;
+
+                // fill queue until dst is satisfied
+                while simple_queue.len() < dst.len() {
+                    // take samples from channel
+                    match rx.try_recv() {
+                        Ok(m) => {
+                            simple_queue.extend(m.data);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {
+                            continue;
+                        }
+                        Err(_) => {
+                            break;
+                        }
+                    }
+                }
+                if simple_queue.len() >= dst.len() {
+                    info!(
+                        "Audio samples out={}, buf={}",
+                        dst.len(),
+                        simple_queue.len()
+                    );
+                    let drain_samples = simple_queue.drain(..dst.len()).collect::<Vec<_>>();
+                    dst.copy_from_slice(&drain_samples);
+                }
+            },
+            move |e| {
+                panic!("{}", e);
+            },
+            None,
+        )?;
+
+        Ok((device, stream))
+    }
 }
 
-pub(crate) struct PlayerAudioStream {
-    pub device: AudioDevice,
-    pub config: SupportedStreamConfig,
-    pub stream: Stream,
-    pub player_state: Arc<AtomicU8>,
-    pub buffer: Arc<Mutex<AudioBuffer>>,
+pub struct BungeeWrapper {
+    ctx: *mut BungeeStream,
 }
 
-pub(crate) struct AudioBuffer {
-    channels: u8,
-    sample_rate: u32,
-    // buffered samples
-    pub samples: VecDeque<f32>,
-    /// Video position in seconds
-    pub video_pos: f32,
-    /// Audio position in seconds
-    pub audio_pos: f32,
-}
+unsafe impl Send for BungeeWrapper {}
 
-impl AudioBuffer {
-    pub fn new(sample_rate: u32, channels: u8) -> Self {
-        Self {
-            channels,
-            sample_rate,
-            samples: VecDeque::new(),
-            video_pos: 0.0,
-            audio_pos: 0.0,
+impl BungeeWrapper {
+    pub fn new(channels: u8, sample_rate: u32) -> Result<BungeeWrapper> {
+        let ctx = {
+            let samples = bungee_sys::SampleRates {
+                input: sample_rate as _,
+                output: sample_rate as _,
+            };
+            let stretcher = bungee_sys::stretcher::create(samples, channels as _, 2);
+            if stretcher.is_null() {
+                bail!("Failed to create stretcher");
+            }
+            let ctx = bungee_sys::stream::create(stretcher, channels as _, 8192);
+            if ctx.is_null() {
+                bail!("Failed to create stretcher stream");
+            }
+            ctx
+        };
+        Ok(Self { ctx })
+    }
+
+    pub fn process(
+        &mut self,
+        frame: AudioSamples,
+        out_data: &mut [f32],
+        out_samples: usize,
+    ) -> Result<()> {
+        let ret = bungee_sys::stream::process(
+            self.ctx,
+            frame.data.as_ptr() as *const _,
+            out_data.as_mut_ptr() as *mut _,
+            frame.samples as _,
+            out_samples as _,
+            1.0,
+        );
+        if ret != 0 {
+            bail!("Failed to process audio");
         }
-    }
-
-    pub fn add_samples(&mut self, samples: Vec<f32>) {
-        self.samples.extend(samples);
-    }
-
-    pub fn take_samples(&mut self, n: usize) -> Vec<f32> {
-        assert_eq!(0, n % self.channels as usize, "Must be a multiple of 2");
-        let will_drain = self.samples.drain(..n.min(self.samples.len()));
-        self.audio_pos += will_drain.len() as f32 / self.sample_rate as f32 / self.channels as f32;
-        will_drain.collect()
-    }
-
-    pub fn audio_delay_samples(&self) -> isize {
-        let samples_f32 = self.sample_rate as f32 * (self.video_pos - self.audio_pos);
-        samples_f32 as isize * self.channels as isize
+        Ok(())
     }
 }

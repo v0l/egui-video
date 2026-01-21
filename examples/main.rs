@@ -1,6 +1,14 @@
 use eframe::NativeOptions;
-use egui::{CentralPanel, TextEdit, ViewportBuilder, Widget};
-use egui_video::{AudioDevice, Player, PlayerControls};
+use egui::{CentralPanel, Response, TextEdit, Ui, ViewportBuilder, Widget};
+use egui_video::{AudioDevice, PlaybackInfo, PlaybackUpdate, Player, PlayerOverlay};
+
+struct EmptyOverlay;
+
+impl PlayerOverlay for EmptyOverlay {
+    fn show(&self, ui: &mut Ui, frame_response: &Response, p: &PlaybackInfo) -> PlaybackUpdate {
+        Default::default()
+    }
+}
 
 fn main() {
     env_logger::init();
@@ -9,9 +17,10 @@ fn main() {
 
     let _ = eframe::run_native("app", opt, Box::new(|cc| Ok(Box::new(App::default()))));
 }
+
 struct App {
     audio_device: AudioDevice,
-    player: Option<Player>,
+    player: Option<Player<EmptyOverlay>>,
 
     media_path: String,
 }
@@ -20,8 +29,9 @@ impl Default for App {
     fn default() -> Self {
         Self {
             audio_device: AudioDevice::new().unwrap(),
-            media_path: "https://data.zap.stream/stream/c5eccf48-8cc4-4e5d-9c66-fa18fdc08fdb.m3u8"
-                .to_string(),
+            media_path:
+                "https://api-core.zap.stream/537a365c-f1ec-44ac-af10-22d14a7319fb/hls/live.m3u8"
+                    .to_string(),
             player: None,
         }
     }
@@ -33,10 +43,11 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.add_enabled_ui(!self.media_path.is_empty(), |ui| {
                     if ui.button("load").clicked() {
-                        let mut p = Player::new(ctx, &self.media_path.replace("\"", ""));
-                        p.start();
-                        p.set_debug(true);
-                        self.player = Some(p);
+                        if let Ok(p) =
+                            Player::new(EmptyOverlay, ctx, &self.media_path.replace("\"", ""))
+                        {
+                            self.player = Some(p);
+                        }
                     }
                 });
                 ui.add_enabled_ui(!self.media_path.is_empty(), |ui| {

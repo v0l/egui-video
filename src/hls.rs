@@ -1,6 +1,6 @@
 use crate::ffmpeg_sys_the_third::{AVPacket, AVStream};
 use anyhow::Result;
-use ffmpeg_rs_raw::{Demuxer, DemuxerInfo};
+use ffmpeg_rs_raw::{AvPacketRef, Demuxer, DemuxerInfo};
 use itertools::Itertools;
 use log::info;
 use m3u8_rs::{MediaPlaylist, MediaPlaylistType, MediaSegment, Playlist, VariantStream};
@@ -202,32 +202,32 @@ impl Read for VariantReader {
 }
 
 pub trait DemuxerIsh {
-    unsafe fn probe_input(&mut self) -> Result<DemuxerInfo>;
-    unsafe fn get_packet(&mut self) -> Result<(*mut AVPacket, *mut AVStream)>;
+    fn probe_input(&mut self) -> Result<DemuxerInfo>;
+    fn get_packet(&mut self) -> Result<(Option<AvPacketRef>, *mut AVStream)>;
 }
 
 impl DemuxerIsh for HlsStream {
-    unsafe fn probe_input(&mut self) -> Result<DemuxerInfo> {
+    fn probe_input(&mut self) -> Result<DemuxerInfo> {
         if self.playlist.is_none() {
             self.load()?;
         }
 
         let demux = self.current_demuxer()?;
-        demux.probe_input()
+        unsafe { demux.probe_input() }
     }
 
-    unsafe fn get_packet(&mut self) -> Result<(*mut AVPacket, *mut AVStream)> {
+    fn get_packet(&mut self) -> Result<(Option<AvPacketRef>, *mut AVStream)> {
         let demux = self.current_demuxer()?;
-        demux.get_packet()
+        unsafe { demux.get_packet() }
     }
 }
 
 impl DemuxerIsh for Demuxer {
-    unsafe fn probe_input(&mut self) -> Result<DemuxerInfo> {
-        self.probe_input()
+    fn probe_input(&mut self) -> Result<DemuxerInfo> {
+        unsafe { self.probe_input() }
     }
 
-    unsafe fn get_packet(&mut self) -> Result<(*mut AVPacket, *mut AVStream)> {
-        self.get_packet()
+    fn get_packet(&mut self) -> Result<(Option<AvPacketRef>, *mut AVStream)> {
+        unsafe { self.get_packet() }
     }
 }

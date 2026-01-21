@@ -20,8 +20,8 @@ pub struct Subtitle {
     italic: bool,
     underline: bool,
     strikethrough: bool,
-    pub(crate) pts: i64,
-    pub(crate) duration: i64,
+    pub(crate) pts: f64,
+    pub(crate) duration: f64,
 }
 
 #[derive(Debug, Default)]
