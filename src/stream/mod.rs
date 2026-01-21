@@ -1,10 +1,7 @@
-use anyhow::Result;
 use egui::ColorImage;
-use ffmpeg_rs_raw::AvFrameRef;
-use std::marker::PhantomData;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 #[cfg(feature = "ffmpeg")]

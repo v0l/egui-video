@@ -2,7 +2,7 @@ use crate::PlayerState;
 use crate::stream::AudioSamples;
 use anyhow::Result;
 use anyhow::bail;
-use bungee_sys::{BungeeStream, BungeeStretcher};
+use bungee_sys::BungeeStream;
 use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::{SampleFormat, Stream};
 use log::info;
@@ -35,10 +35,10 @@ impl AudioDevice {
     }
 
     pub fn open_default_audio_stream(
-        volume: Arc<AtomicU16>,
-        mute: Arc<AtomicBool>,
+        _volume: Arc<AtomicU16>,
+        _mute: Arc<AtomicBool>,
         state: Arc<AtomicU8>,
-        speed: Arc<AtomicI16>,
+        _speed: Arc<AtomicI16>,
         position: Arc<AtomicI64>,
         rx: Receiver<AudioSamples>,
     ) -> Result<(AudioDevice, Stream)> {
@@ -53,7 +53,7 @@ impl AudioDevice {
 
         let channels = cfg.channels() as u8;
         let mut simple_queue = VecDeque::new();
-        let mut bungee_stream = BungeeWrapper::new(channels, cfg.sample_rate() as _)?;
+        let _bungee_stream = BungeeWrapper::new(channels, cfg.sample_rate() as _)?;
         let stream = device.0.build_output_stream_raw(
             &cfg.config(),
             SampleFormat::I32,
@@ -68,7 +68,7 @@ impl AudioDevice {
                     return;
                 }
                 let current_pts = position.load(Ordering::Relaxed) as f64 / 1000.0;
-                let mut frame_pts = current_pts;
+                let _frame_pts = current_pts;
 
                 // fill queue until dst is satisfied
                 while simple_queue.len() < dst.len() {

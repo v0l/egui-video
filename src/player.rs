@@ -1,21 +1,20 @@
-use crate::stream::{AudioSamples, DecoderInfo, MediaDecoder, SubtitlePacket, VideoFrame};
+use crate::stream::{DecoderInfo, MediaDecoder, SubtitlePacket, VideoFrame};
 #[cfg(feature = "subtitles")]
 use crate::subtitle::Subtitle;
-use crate::{AudioDevice, BungeeWrapper};
+use crate::AudioDevice;
 use anyhow::Result;
 use cpal::traits::DeviceTrait;
-use cpal::{SampleFormat, Stream};
+use cpal::Stream;
 use egui::load::SizedTexture;
 use egui::{
     Align2, Color32, ColorImage, Event, FontId, Image, Key, Rect, Response, Sense, Stroke,
     StrokeKind, TextureHandle, TextureOptions, Ui, Vec2, Widget, pos2, vec2,
 };
-use log::{error, info, trace};
-use std::collections::VecDeque;
+use log::trace;
 use std::ops::Add;
 use std::sync::atomic::{AtomicBool, AtomicI16, AtomicI64, AtomicU8, AtomicU16, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(not(feature = "subtitles"))]
@@ -307,7 +306,7 @@ where
         self.request_repaint_for_next_frame();
     }
 
-    fn generate_frame_image(&self, size: Vec2) -> Image {
+    fn generate_frame_image(&self, size: Vec2) -> Image<'_> {
         Image::new(SizedTexture::new(self.frame.id(), size)).sense(Sense::click())
     }
 
@@ -349,7 +348,7 @@ where
         ui.put(rect, self.generate_frame_image(video_size))
     }
 
-    fn render_subtitles(&mut self, ui: &mut Ui) {
+    fn render_subtitles(&mut self, _ui: &mut Ui) {
         #[cfg(feature = "subtitles")]
         if let Some(s) = self.subtitle.as_ref() {
             let sub_end = s.pts + s.duration;
@@ -586,7 +585,7 @@ where
         frame_response
     }
 
-    fn process_update(&mut self, updates: PlaybackUpdate) {
+    fn process_update(&mut self, _updates: PlaybackUpdate) {
         // TODO: change internal state
     }
 

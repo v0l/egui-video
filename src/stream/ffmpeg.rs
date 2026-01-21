@@ -1,18 +1,18 @@
 use crate::stream::{
     AudioSamples, DecoderInfo, MediaDecoder, MediaStreams, StreamInfo, SubtitlePacket, VideoFrame,
 };
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow};
 use egui::{Color32, ColorImage, Vec2};
 use ffmpeg_rs_raw::ffmpeg_sys_the_third::{
-    AV_NOPTS_VALUE, AVMediaType, AVPixelFormat, AVSampleFormat, av_frame_move_ref,
-    av_get_pix_fmt_name, av_get_sample_fmt_name, av_q2d, avcodec_get_name,
+    AV_NOPTS_VALUE, AVMediaType, AVPixelFormat, AVSampleFormat, av_get_pix_fmt_name,
+    av_get_sample_fmt_name, av_q2d, avcodec_get_name,
 };
 use ffmpeg_rs_raw::{AvFrameRef, Decoder, Demuxer, Resample, Scaler, get_frame_from_hw, rstr};
-use log::{debug, error, info};
+use log::{error, info};
 use std::mem::transmute;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
-use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 fn video_frame_to_image(frame: &AvFrameRef) -> ColorImage {
@@ -59,7 +59,7 @@ impl MediaDecoder {
     pub fn new(input: &str) -> Result<(Self, MediaStreams)> {
         let (tx_m, rx_m) = sync_channel(1);
         let (tx_v, rx_v) = sync_channel(10);
-        let (tx_a, rx_a) = sync_channel(10_000);
+        let (tx_a, rx_a) = sync_channel(1_000);
         let (tx_s, rx_s) = sync_channel(10);
         let stream_v = Arc::new(AtomicUsize::new(0));
         let stream_a = Arc::new(AtomicUsize::new(0));
